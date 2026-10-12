@@ -1,0 +1,13 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+title: "Automated Self-Healing Cloud Infrastructure on AWS EC2: software artefact"
+type: software
+authors:
+  - family-names: "Duong"
+    given-names: "Tat Hung"
+    affiliation: "Darmstadt University of Applied Sciences / Vietnamese-German University"
+repository-code: "https://github.com/HarryDuong81/self-healing-aws-thesis"
+license: MIT
+version: "1.0.0"
+date-released: "2026-10-12"
+abstract: "Closed-loop (MAPE-K) pipeline that detects six fault classes on AWS EC2 from Prometheus metrics and remediates them with Ansible or Terraform. Software artefact of the MSc thesis 'Automated Self-Healing Cloud Infrastructure: An Empirical Study of Observability-Triggered Terraform and Ansible Remediation on AWS EC2'."

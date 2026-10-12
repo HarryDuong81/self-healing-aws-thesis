@@ -1,0 +1,11 @@
+{
+  "title": "Automated Self-Healing Cloud Infrastructure on AWS EC2: software artefact",
+  "upload_type": "software",
+  "description": "Closed-loop (MAPE-K) pipeline that detects six fault classes on AWS EC2 from Prometheus metrics and remediates them with Ansible or Terraform. Software artefact of the MSc thesis \"Automated Self-Healing Cloud Infrastructure: An Empirical Study of Observability-Triggered Terraform and Ansible Remediation on AWS EC2\". The experimental dataset is deposited separately.",
+  "creators": [
+    {"name": "Duong, Tat Hung", "affiliation": "Darmstadt University of Applied Sciences / Vietnamese-German University"}
+  ],
+  "license": "MIT",
+  "access_right": "open",
+  "keywords": ["self-healing", "MAPE-K", "AWS EC2", "Terraform", "Ansible", "observability", "MTTR"]
+}
