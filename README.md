@@ -39,7 +39,7 @@ Deploying the lab creates billable AWS resources (one `t3.medium` monitoring hos
 
 ## Licence and citation
 
-Licence: MIT for the code (see `LICENSE`); CC BY 4.0 for the dataset archive.
+Licence: MIT for the code and for the dataset archive (see `LICENSE`).
 
 Archived on Zenodo:
 
