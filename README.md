@@ -39,4 +39,11 @@ Deploying the lab creates billable AWS resources (one `t3.medium` monitoring hos
 
 ## Licence and citation
 
-Licence: MIT for the code and for the dataset archive (see `LICENSE`). Citation: *thesis reference and dataset DOI to be added when available.*
+Licence: MIT for the code (see `LICENSE`); CC BY 4.0 for the dataset archive.
+
+Archived on Zenodo:
+
+- Software (this repository, v1.0.0): [10.5281/zenodo.23319490](https://doi.org/10.5281/zenodo.23319490) (concept DOI, always the latest version); v1.0.0 is [10.5281/zenodo.23319491](https://doi.org/10.5281/zenodo.23319491).
+- Dataset (`Final_Thesis_Dataset_2026-10-08_v10.zip`, `S2_calibration_2026-10-11_public.zip`, `SHA256SUMS.txt`): [10.5281/zenodo.23319631](https://doi.org/10.5281/zenodo.23319631) (concept DOI); this version is [10.5281/zenodo.23319632](https://doi.org/10.5281/zenodo.23319632).
+
+Thesis reference: *to be added when available.*
