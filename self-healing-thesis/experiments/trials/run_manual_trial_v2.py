@@ -109,6 +109,16 @@ Usage:
     python3 experiments/trials/run_manual_trial_v2.py \\
         --fault instance_failure --target target-2 --block 7 --force --official \\
         --trial-id official-instfail-07
+
+    # Calibration trial (writes to mttr_log_s2_calibration.jsonl, run_type="calibration";
+    # all six classes allowed; never part of the official dataset). Identical operator
+    # protocol and identical t_alert_ms semantics (first appearance of the ALERTS
+    # series, i.e. the pending state); additionally a background recorder, invisible
+    # to the operator, stores when the alert was first seen pending and first seen
+    # firing (t_alert_pending_seen_ms / t_alert_firing_seen_ms, -1 = not observed).
+    python3 experiments/trials/run_manual_trial_v2.py \\
+        --fault cpu_overload --target target-1 --block -1 \\
+        --trial-id calib-cpu-01 --calibration
 """
 
 from __future__ import annotations
@@ -129,6 +139,7 @@ _RESULTS_DIR = _REPO_ROOT / "results"
 _JSONL_PATH_PILOT      = _RESULTS_DIR / "mttr_log_s2_pilot.jsonl"
 _JSONL_PATH_SHAKEDOWN  = _RESULTS_DIR / "mttr_log_s2_shakedown.jsonl"
 _JSONL_PATH_OFFICIAL   = _RESULTS_DIR / "mttr_log_s2_v2_official.jsonl"
+_JSONL_PATH_CALIBRATION = _RESULTS_DIR / "mttr_log_s2_calibration.jsonl"
 
 sys.path.insert(0, str(_REPO_ROOT))
 from experiments.correlation.correlate import find_recent_injection  # noqa: E402
@@ -285,6 +296,21 @@ def _query_alerts_firing(prometheus_url: str, fault_type: str, node_name: str) -
     return bool(data.get("data", {}).get("result"))
 
 
+def _query_alert_states(prometheus_url: str, fault_type: str, node_name: str) -> set:
+    """Return the set of alertstate values ({'pending'}, {'firing'}, both, or empty)
+    currently reported by the ALERTS series for this fault_type/node_name. Used only
+    by the calibration recorder; _query_alerts_firing above is intentionally left
+    unchanged (it matches either state, so it detects the pending state)."""
+    import urllib.parse
+    import urllib.request
+
+    query = f'ALERTS{{fault_type="{fault_type}",node_name="{node_name}"}}'
+    url = f"{prometheus_url}/api/v1/query?" + urllib.parse.urlencode({"query": query})
+    with urllib.request.urlopen(url, timeout=5) as resp:
+        data = json.loads(resp.read())
+    return {r.get("metric", {}).get("alertstate", "") for r in data.get("data", {}).get("result", [])}
+
+
 def _wait_for_alert_firing(prometheus_url: str, fault_type: str, node_name: str,
                             timeout: int) -> Optional[int]:
     """Poll until the alert starts firing (t_alert). Returns epoch ms, or
@@ -417,29 +443,38 @@ def main(argv: Optional[list[str]] = None) -> int:
                               "(6 fault classes x 10 repetitions), the only mode permitted to "
                               "use the full six-class vocabulary. Mutually exclusive with "
                               "--shakedown.")
+    parser.add_argument("--calibration", action="store_true",
+                         help="Route this trial to results/mttr_log_s2_calibration.jsonl "
+                              "(run_type='calibration', trial_id prefix 'calib-'). Same operator "
+                              "protocol and timestamps as the other modes; additionally records "
+                              "when the alert was first seen pending and first seen firing. "
+                              "Allows all six fault classes. Mutually exclusive with "
+                              "--shakedown and --official.")
     args = parser.parse_args(argv)
 
-    if args.shakedown and args.official:
-        print("ERROR: --shakedown and --official are mutually exclusive.", file=sys.stderr)
+    if sum([args.shakedown, args.official, args.calibration]) > 1:
+        print("ERROR: --shakedown, --official and --calibration are mutually exclusive.", file=sys.stderr)
         return 2
 
-    if args.official:
+    if args.calibration:
+        mode, prefix, jsonl_path = "calibration", "calib-", _JSONL_PATH_CALIBRATION
+    elif args.official:
         mode, prefix, jsonl_path = "official", "official-", _JSONL_PATH_OFFICIAL
     elif args.shakedown:
         mode, prefix, jsonl_path = "shakedown", "shakedown-", _JSONL_PATH_SHAKEDOWN
     else:
         mode, prefix, jsonl_path = "pilot", "pilot-", _JSONL_PATH_PILOT
 
-    if not args.official and args.fault not in _PILOT_FAULT_CLASSES:
+    if not (args.official or args.calibration) and args.fault not in _PILOT_FAULT_CLASSES:
         print(
-            f"ERROR: --fault {args.fault!r} is only valid with --official. Pilot/shakedown "
+            f"ERROR: --fault {args.fault!r} is only valid with --official or --calibration. Pilot/shakedown "
             f"mode is restricted to {_PILOT_FAULT_CLASSES} (the frozen pilot scope, preserved "
             f"post-freeze rather than loosened retroactively).",
             file=sys.stderr,
         )
         return 2
 
-    _OTHER_PREFIXES = {"official-", "shakedown-", "pilot-"} - {prefix}
+    _OTHER_PREFIXES = {"official-", "shakedown-", "pilot-", "calib-"} - {prefix}
     if args.trial_id is None:
         args.trial_id = f"{prefix}{args.fault}-{args.target}-{int(time.time())}"
     elif not args.trial_id.startswith(prefix):
@@ -479,6 +514,21 @@ def main(argv: Optional[list[str]] = None) -> int:
           f"block={args.block} output={jsonl_path.name} ===")
     print("(fault class withheld from here on — do not reveal it to the operator)")
 
+    # ---- calibration only: background alert-state recorder (silent) ------
+    recorder = None
+    if args.calibration:
+        from experiments.trials.alert_state_recorder import AlertStateRecorder  # noqa: E402
+        recorder = AlertStateRecorder(
+            lambda: _query_alert_states(args.prometheus_url, args.fault, node_name), interval_s=1.0)
+        recorder.start()
+
+    def _calibration_fields() -> dict:
+        """Stop the recorder (idempotent) and return its record fields; {} outside calibration mode."""
+        if recorder is None:
+            return {}
+        recorder.stop()
+        return recorder.as_fields()
+
     # ---- t_fault: dispatch, then read back the authoritative t0 ----------
     _inject_fault_detached(args.target, args.fault, duration, trial_id, args.block, args.region)
     t_fault_ms = _resolve_t_fault(args.target, args.fault, trial_id)
@@ -488,7 +538,8 @@ def main(argv: Optional[list[str]] = None) -> int:
     t_alert_ms = _wait_for_alert_firing(args.prometheus_url, args.fault, node_name, _ALERT_WAIT_TIMEOUT_S)
     if t_alert_ms is None:
         return _finalize_failure(trial_id, args, node_name, t_fault_ms, "alert_never_fired",
-                                  "alert_never_fired", jsonl_path, run_type)
+                                  "alert_never_fired", jsonl_path, run_type,
+                                  extra={"alert_state_fields": _calibration_fields()})
     print(f"[t_alert]        {t_alert_ms}")
 
     # ---- t_notification / t_ack --------------------------------------------
@@ -576,6 +627,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                     "t_alert_ms": t_alert_ms, "t_notification_ms": t_notification_ms,
                     "t_ack_ms": t_ack_ms, "t_classified_ms": t_classified_ms,
                     "t_actuate_ms": t_actuate_ms, "t_remediated_ms": t_remediated_ms,
+                    "alert_state_fields": _calibration_fields(),
                 },
             )
 
@@ -594,9 +646,12 @@ def main(argv: Optional[list[str]] = None) -> int:
                 "t_ack_ms": t_ack_ms, "t_classified_ms": t_classified_ms,
                 "t_actuate_ms": t_actuate_ms, "t_remediated_ms": t_remediated_ms,
                 "t_observability_restored_ms": t_observability_restored_ms,
+                "alert_state_fields": _calibration_fields(),
             },
         )
     print(f"[t_validated]     {t_validated_ms}")
+    if recorder is not None:
+        recorder.stop()  # stop observing at the validation instant, so no later re-fire can be recorded as 'first firing'
 
     # ---- assemble phases -----------------------------------------------
     T_detect          = round((t_alert_ms - t_fault_ms) / 1000.0, 3)
@@ -681,6 +736,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         "recovery_status":          "success",
         "escalation_reason":        "",
     }
+    record.update(_calibration_fields())
     _assert_record_schema(record)
 
     _RESULTS_DIR.mkdir(exist_ok=True)
@@ -733,6 +789,7 @@ def _finalize_failure(trial_id: str, args, node_name: str, t_fault_ms: int,
         "recovery_status":  recovery_status,
         "escalation_reason": escalation_reason,
     }
+    record.update(extra.get("alert_state_fields", {}))
     _assert_record_schema(record)
 
     _RESULTS_DIR.mkdir(exist_ok=True)
