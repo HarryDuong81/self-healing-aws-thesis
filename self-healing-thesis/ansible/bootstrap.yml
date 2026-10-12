@@ -1,0 +1,380 @@
+---
+# =============================================================================
+# ansible/bootstrap.yml — Telemetry agent installation and service bootstrap
+#
+# Run once per deployment after `terraform apply` completes.
+# Idempotent — safe to run multiple times.
+#
+# Plays:
+#   1. monitoring_host — Docker, Docker Compose, Terraform CLI, AWS CLI,
+#                        Ansible (for runtime remediation), orchestrator env
+#   2. target_nodes    — Node Exporter, Filebeat, NGINX, OTel agent
+#
+# Usage:
+#   # Full bootstrap (all nodes):
+#   ansible-playbook ansible/bootstrap.yml -i ansible/inventory/aws_ec2.yml
+#
+#   # Monitoring server only (after cold deploy step 2):
+#   ansible-playbook ansible/bootstrap.yml -i ansible/inventory/aws_ec2.yml \
+#     --limit monitoring_host
+#
+#   # Target nodes only (after terraform/targets apply):
+#   ansible-playbook ansible/bootstrap.yml -i ansible/inventory/aws_ec2.yml \
+#     --limit target_nodes
+#
+# Connection:
+#   monitoring_host — SSH (public EIP)
+#   target_nodes    — community.aws.aws_ssm (no port 22 on targets)
+#
+# Thesis reference: §4.2 Cold deploy, §3.3 Spatial topology
+# =============================================================================
+
+# ── Play 1: Monitoring / Orchestrator Server ──────────────────────────────────
+- name: "Bootstrap monitoring server — observability stack and orchestrator"
+  hosts: monitoring_host
+  become: yes
+  gather_facts: yes
+
+  vars:
+    # Pinned versions — Thesis Table 4.1 / Table 4.3
+    docker_compose_version: "v2.24.0"
+    terraform_version:      "1.14.9"
+    aws_cli_version:        "2"        # major; minor handled by install script
+    node_exporter_version:  "1.7.0"
+
+    monitoring_base_dir:   /opt/monitoring
+    orchestrator_base_dir: /opt/orchestrator
+    results_dir:           /opt/orchestrator/results
+    logs_dir:              /opt/orchestrator/logs
+    ansible_playbooks_dir: /opt/orchestrator/ansible
+
+  tasks:
+
+    - name: "System | Update apt cache"
+      apt:
+        update_cache: yes
+        cache_valid_time: 3600
+
+    - name: "System | Install base packages"
+      apt:
+        name:
+          - curl
+          - wget
+          - git
+          - unzip
+          - jq
+          - python3
+          - python3-pip
+          - python3-venv
+          - awscli
+        state: present
+
+    # ── Docker ────────────────────────────────────────────────────────────────
+    - name: "Docker | Install via official convenience script"
+      shell: |
+        curl -fsSL https://get.docker.com | sh
+      args:
+        creates: /usr/bin/docker
+
+    - name: "Docker | Add ubuntu to docker group"
+      user:
+        name: ubuntu
+        groups: docker
+        append: yes
+
+    - name: "Docker | Enable and start service"
+      systemd:
+        name: docker
+        enabled: yes
+        state: started
+
+    - name: "Docker Compose | Install {{ docker_compose_version }}"
+      get_url:
+        url: "https://github.com/docker/compose/releases/download/{{ docker_compose_version }}/docker-compose-linux-x86_64"
+        dest: /usr/local/bin/docker-compose
+        mode: "0755"
+
+    - name: "Docker Compose | Symlink for compose v2 subcommand"
+      file:
+        src: /usr/local/bin/docker-compose
+        dest: /usr/libexec/docker/cli-plugins/docker-compose
+        state: link
+        force: yes
+
+    # ── Terraform ─────────────────────────────────────────────────────────────
+    - name: "Terraform | Check installed version"
+      command: terraform version -json
+      register: tf_installed
+      changed_when: false
+      failed_when: false
+
+    - name: "Terraform | Install v{{ terraform_version }}"
+      shell: |
+        set -euo pipefail
+        TF_URL="https://releases.hashicorp.com/terraform/{{ terraform_version }}/terraform_{{ terraform_version }}_linux_amd64.zip"
+        wget -q "$TF_URL" -O /tmp/terraform.zip
+        unzip -o /tmp/terraform.zip -d /usr/local/bin/
+        chmod +x /usr/local/bin/terraform
+        rm -f /tmp/terraform.zip
+      when: >-
+        tf_installed.rc != 0 or
+        ('"' + terraform_version + '"') not in tf_installed.stdout
+
+    - name: "Terraform | Verify pin"
+      command: terraform version -json
+      register: tf_version_out
+      changed_when: false
+
+    - name: "Terraform | Assert version {{ terraform_version }}"
+      assert:
+        that:
+          - terraform_version in tf_version_out.stdout
+        fail_msg: "Terraform version mismatch — expected {{ terraform_version }}, got: {{ tf_version_out.stdout }}"
+
+    # ── Python / Ansible in orchestrator venv ─────────────────────────────────
+    # Must run as ubuntu, not root: roles/self_healing's own venv-management
+    # tasks (same /opt/orchestrator/venv path) run become_user: ubuntu and rely
+    # on a `creates:` guard to stay idempotent. If this play created the venv
+    # as root first, self_healing's guard matches the (now root-owned) path and
+    # skips, and its later pip installs into that venv then fail with
+    # Permission Denied as ubuntu. Confirmed live, 2026-09-28.
+    - name: "Python | Create orchestrator virtualenv"
+      command: python3 -m venv /opt/orchestrator/venv
+      args:
+        creates: /opt/orchestrator/venv/bin/activate
+      become_user: ubuntu
+
+    - name: "Python | Install ansible-core 2.17.x in venv"
+      pip:
+        name:
+          - "ansible-core>=2.17,<2.18"
+          - "boto3"
+          - "botocore"
+        virtualenv: /opt/orchestrator/venv
+        state: present
+      become_user: ubuntu
+
+    - name: "Ansible | Install community.aws collection"
+      command: /opt/orchestrator/venv/bin/ansible-galaxy collection install community.aws:>=9.0.0,<10.0.0 community.general
+      args:
+        creates: /home/ubuntu/.ansible/collections/ansible_collections/community/aws
+      become_user: ubuntu
+
+    # ── Directory layout ───────────────────────────────────────────────────────
+    - name: "Dirs | Create monitoring and orchestrator directories"
+      file:
+        path: "{{ item }}"
+        state: directory
+        owner: ubuntu
+        group: ubuntu
+        mode: "0755"
+      loop:
+        - "{{ monitoring_base_dir }}"
+        - "{{ orchestrator_base_dir }}"
+        - "{{ results_dir }}"
+        - "{{ logs_dir }}"
+        - "{{ ansible_playbooks_dir }}"
+
+    # ── Sync observability configs from repo ───────────────────────────────────
+    # `synchronize` requires rsync over SSH/Docker/local filesystem and does
+    # not work over the community.aws.aws_ssm connection plugin (confirmed
+    # live: "This remote host is being accessed via amazon.aws.aws_ssm
+    # instead so it cannot work"). `copy` uses Ansible's standard module
+    # file-transfer path instead, which is connection-agnostic.
+    - name: "Observability | Copy docker-compose and configs to monitoring dir"
+      copy:
+        src: "{{ playbook_dir }}/../observability/"
+        dest: "{{ monitoring_base_dir }}/"
+        mode: preserve
+
+    - name: "Observability | Copy ansible playbooks to orchestrator dir"
+      copy:
+        src: "{{ playbook_dir }}/"
+        dest: "{{ ansible_playbooks_dir }}/"
+        mode: preserve
+
+    # ── Log rotation ──────────────────────────────────────────────────────────
+    - name: "Logrotate | Install Ansible log rotation"
+      copy:
+        dest: /etc/logrotate.d/ansible-self-healing
+        content: |
+          /var/log/ansible/self-healing.log {
+            daily
+            rotate 14
+            compress
+            missingok
+            notifempty
+            create 640 root adm
+          }
+
+    - name: "Log | Create Ansible log directory"
+      file:
+        path: /var/log/ansible
+        state: directory
+        mode: "0755"
+
+
+# ── Play 2: Target EC2 Instances ──────────────────────────────────────────────
+- name: "Bootstrap target nodes — Node Exporter, Filebeat, NGINX, OTel Agent"
+  hosts: target_nodes
+  become: yes
+  gather_facts: no   # avoid SSM setup-module latency on first bootstrap
+
+  vars:
+    node_exporter_version: "1.7.0"
+    # filebeat_version / otel_collector_version now come from
+    # roles/filebeat and roles/otel_collector's own defaults (single
+    # source of truth shared with diagnostic_agents.yml).
+    # groups['monitoring_host'][0] is the INVENTORY HOSTNAME string (the EC2
+    # Name tag) - not an IP; targets have no DNS able to resolve that name
+    # (confirmed live via `filebeat test output`: "ERROR lookup ...
+    # server misbehaving"). hostvars[...]['ec2_private_ip'] is the correct
+    # pattern (already used correctly in orchestrator.env.j2's
+    # MONITORING_SERVER_IP).
+    monitoring_host_ip:    "{{ hostvars[groups['monitoring_host'][0]]['ec2_private_ip'] | default('127.0.0.1') }}"
+
+  tasks:
+
+    # Extracted into roles/apt_lock_guard so both this play and
+    # ansible/playbooks/diagnostic_agents.yml share one guard instead of
+    # duplicated copies.
+    - name: "System | Guard against in-progress apt/dpkg lock"
+      include_role:
+        name: apt_lock_guard
+
+    - name: "System | Update apt cache and upgrade"
+      shell: |
+        export DEBIAN_FRONTEND=noninteractive
+        apt-get update -qq
+        apt-get upgrade -y -qq
+
+    - name: "System | Install base packages"
+      shell: |
+        export DEBIAN_FRONTEND=noninteractive
+        apt-get install -y -qq \
+          curl wget jq gnupg \
+          stress-ng \
+          python3 python3-pip \
+          nginx \
+          sysstat
+
+    # ── NGINX configuration ────────────────────────────────────────────────────
+    # NOTE: /etc/nginx/conf.d/health.conf already exists on this host, written
+    # by user_data cloud-init at first boot (detection-path
+    # component) and already claims `default_server` on :80. This block must
+    # NOT also claim it — nginx allows only one default_server per
+    # address:port and fails to start with "a duplicate default server"
+    # otherwise (confirmed live via `nginx -t` / journalctl across all 3
+    # targets).
+    - name: "NGINX | Write /healthz endpoint config"
+      copy:
+        dest: /etc/nginx/conf.d/healthz.conf
+        content: |
+          server {
+              listen 80;
+              location /healthz {
+                  access_log off;
+                  return 200 "ok\n";
+                  add_header Content-Type text/plain;
+              }
+              location /nginx_status {
+                  stub_status;
+                  access_log off;
+                  allow 10.0.0.0/8;
+                  deny all;
+              }
+          }
+
+    - name: "NGINX | Remove default site"
+      file:
+        path: /etc/nginx/sites-enabled/default
+        state: absent
+
+    - name: "NGINX | Enable and start service"
+      systemd:
+        name: nginx
+        enabled: yes
+        state: restarted
+
+    # ── Node Exporter ──────────────────────────────────────────────────────────
+    - name: "Node Exporter | Install v{{ node_exporter_version }}"
+      shell: |
+        set -euo pipefail
+        NE_URL="https://github.com/prometheus/node_exporter/releases/download/v{{ node_exporter_version }}/node_exporter-{{ node_exporter_version }}.linux-amd64.tar.gz"
+        wget -q "$NE_URL" -O /tmp/node_exporter.tar.gz
+        tar -xzf /tmp/node_exporter.tar.gz -C /tmp/
+        install -m 0755 /tmp/node_exporter-{{ node_exporter_version }}.linux-amd64/node_exporter /usr/local/bin/
+        rm -rf /tmp/node_exporter*
+      args:
+        creates: /usr/local/bin/node_exporter
+
+    - name: "Node Exporter | Create systemd service"
+      copy:
+        dest: /etc/systemd/system/node_exporter.service
+        content: |
+          [Unit]
+          Description=Node Exporter (Prometheus target metrics)
+          After=network.target
+
+          [Service]
+          Type=simple
+          User=nobody
+          ExecStart=/usr/local/bin/node_exporter \
+            --collector.systemd \
+            --collector.processes \
+            --web.listen-address=:9100
+          Restart=on-failure
+          RestartSec=5s
+
+          [Install]
+          WantedBy=multi-user.target
+
+    - name: "Node Exporter | Enable and start"
+      systemd:
+        name: node_exporter
+        daemon_reload: yes
+        enabled: yes
+        state: started
+
+    # ── Filebeat + OTel Agent (diagnostic-path telemetry) ─────────────────
+    # Extracted into roles/filebeat and roles/otel_collector so both this
+    # cold-deploy play and ansible/playbooks/diagnostic_agents.yml (invoked
+    # by the orchestrator's Execute layer after instance_failure recreation)
+    # share one task definition each, instead of duplicated copies.
+    - name: "Filebeat | Install via role"
+      include_role:
+        name: filebeat
+
+    - name: "OTel Collector | Install via role"
+      include_role:
+        name: otel_collector
+
+    # ── Syslog verification ────────────────────────────────────────────────────
+    - name: "Verify | Confirm Node Exporter is listening on :9100"
+      shell: ss -tlnp | grep ':9100'
+      register: ne_check
+      changed_when: false
+      failed_when: ne_check.rc != 0
+
+    - name: "Verify | Confirm NGINX is listening on :80"
+      shell: ss -tlnp | grep ':80'
+      register: nginx_check
+      changed_when: false
+      failed_when: nginx_check.rc != 0
+
+    - name: "Verify | HTTP GET /healthz returns 200"
+      uri:
+        url: "http://localhost/healthz"
+        method: GET
+        status_code: 200
+        timeout: 5
+      register: health_check
+
+    - name: "Log | Bootstrap complete"
+      command: >
+        logger -t self-healing
+        "BOOTSTRAP_COMPLETE host={{ inventory_hostname }}
+         node_exporter={{ ne_check.rc == 0 }}
+         nginx={{ nginx_check.rc == 0 }}
+         healthz={{ health_check.status }}"
+      changed_when: false

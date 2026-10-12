@@ -1,0 +1,11 @@
+---
+# roles/otel_collector/defaults/main.yml
+# Single source of truth for the target-side OTel Agent version — both
+# ansible/bootstrap.yml's target_nodes play and
+# ansible/playbooks/diagnostic_agents.yml invoke this same role, so they
+# automatically share this one value. Kept aligned by convention with
+# roles/monitoring_stack/defaults/main.yml's otel_collector_version (the
+# central collector's own pin) — role defaults do not cross plays in
+# Ansible, so this cannot be a direct reference, only a matching value.
+# pin: OpenTelemetry Collector 0.152.0.
+otel_collector_version: "0.152.0"

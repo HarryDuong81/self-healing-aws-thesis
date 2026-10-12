@@ -1,0 +1,171 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  AWS_DEFAULT_REGION: ap-southeast-1
+  TF_IN_AUTOMATION: "true"
+  PYTHONUNBUFFERED: "1"
+
+jobs:
+  pre-flight:
+    name: Pre-flight
+    runs-on: ubuntu-24.04
+
+    # The git root is ITS2024_Master_Thesis; the artefact lives one level down.
+    # This applies to every `run:` step below, so individual commands keep their
+    # repository-relative paths. It does NOT apply to `uses:` steps — action
+    # inputs that name a path (cache-dependency-path) carry the prefix
+    # explicitly.
+    defaults:
+      run:
+        working-directory: self-healing-thesis
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Python 3.14
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.14"
+          cache: pip
+          cache-dependency-path: self-healing-thesis/requirements.txt
+
+      - name: Set up Terraform 1.14.9
+        uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: "1.14.9"
+          terraform_wrapper: false
+
+      # Order matters. The root requirements.txt carries `>=` constraints for
+      # test and analysis tooling; orchestrator/requirements.txt carries the
+      # `==` pins the deployed service actually runs. Installing the pinned set
+      # LAST makes those pins win, so the unit suite exercises the same library
+      # versions as production rather than whatever upstream published today.
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+          python -m pip install -r orchestrator/requirements.txt
+
+          # Mirror the two post-install fixups roles/self_healing applies to
+          # the deployed venv — production is the pin set PLUS these, and
+          # without them CI diverges from the runtime it is meant to verify.
+          #
+          #   setuptools<75  opentelemetry-instrumentation 0.45b0 imports
+          #                  pkg_resources, which modern venv no longer bundles.
+          #                  75+ removed pkg_resources entirely, so the ceiling
+          #                  is load-bearing, not cosmetic.
+          #   protobuf       4.25.9 (transitive via the OTLP gRPC exporter)
+          #                  predates Python 3.14 wheels; its _upb C extension
+          #                  dies on import with "Metaclasses with custom
+          #                  tp_new are not supported".
+          python -m pip install 'setuptools<75'
+          python -m pip install --upgrade protobuf
+
+          python -m pip install ruff==0.12.10
+
+      - name: Verify pinned toolchain
+        run: |
+          terraform version | grep -F 'Terraform v1.14.9'
+          python --version | grep -E 'Python 3\.14\.'
+          ruff --version | grep -F 'ruff 0.12.10'
+          docker --version
+          docker compose version
+
+      # `terraform validate` requires initialised providers. -backend=false
+      # installs them without touching (or needing credentials for) the S3
+      # backend, which is what keeps this job AWS-free.
+      - name: Terraform format and validation
+        run: |
+          terraform -chdir=terraform/bootstrap fmt -check -recursive
+          terraform -chdir=terraform/bootstrap init -backend=false -input=false
+          terraform -chdir=terraform/bootstrap validate
+          terraform -chdir=terraform/targets fmt -check -recursive
+          terraform -chdir=terraform/targets init -backend=false -input=false
+          terraform -chdir=terraform/targets validate
+
+      # terraform/modules/ is a sibling of both root configurations, so neither
+      # `fmt -check -recursive` above reaches it. Check it explicitly.
+      - name: Terraform module formatting
+        run: terraform -chdir=terraform/modules fmt -check -recursive
+
+      # Keep this command strict. The repository carries the pinned Ruff
+      # version and an explicit ruff.toml rule set; CI must not silently
+      # auto-fix or ignore findings.
+      - name: Python lint
+        run: ruff check orchestrator/
+
+      - name: Unit tests
+        run: python -m pytest tests/unit/ -v
+
+      - name: Docker Compose configuration check
+        run: docker compose -f observability/docker-compose.yml config -q
+
+  # ── Ansible lint and syntax check — separate job, separate interpreter ──────
+  #
+  # ansible-lint's `ansible_compat` dependency refuses to run ansible-core 2.17
+  # on Python 3.14: "Python 3.14 requires ansible-core version >= 2.20.0, and
+  # we found 2.17.14". ansible-core 2.17 itself runs fine on 3.14 — the
+  # monitoring host does exactly that with the AMI's native 3.14.4 — so neither
+  # pin is at fault and neither is changed here.
+  #
+  # .toolchain's `python=3.14` pins the ORCHESTRATOR RUNTIME, which is what
+  # reproducibility depends on (Ch.4 Table 4.2). The interpreter a linter runs
+  # under is build tooling and affects nothing the campaign measures, so this
+  # job uses 3.12 purely to satisfy ansible-lint while still exercising the
+  # pinned ansible-core 2.17.14 that production uses.
+  ansible:
+    name: Ansible lint and syntax check
+    runs-on: ubuntu-24.04
+
+    defaults:
+      run:
+        working-directory: self-healing-thesis
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Python 3.12 (lint tooling only — see comment above)
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      # Collections come from ansible/requirements.yml so CI and the CD path
+      # (deploy.yml's /opt/deploy-venv) install an identical set.
+      - name: Install ansible-core and ansible-lint
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install \
+            ansible-core==2.17.14 \
+            ansible-lint==24.10.0
+          ansible-galaxy collection install -r ansible/requirements.yml
+
+      - name: Verify pinned ansible-core
+        run: ansible --version | grep -m1 -E 'core 2\.17\.'
+
+      # ANSIBLE_CONFIG makes ansible-lint honour ansible.cfg's `roles_path =
+      # roles`; without it, playbooks/deploy.yml and diagnostic_agents.yml
+      # report their imported roles as unresolvable. Lint profile is set in
+      # .ansible-lint, alongside the reasoning for choosing `min`.
+      - name: Ansible lint and syntax check
+        env:
+          ANSIBLE_CONFIG: ansible/ansible.cfg
+        run: |
+          ansible-lint ansible/
+          for playbook in ansible/playbooks/*.yml ansible/site.yml ansible/bootstrap.yml; do
+            ansible-playbook "$playbook" --syntax-check
+          done

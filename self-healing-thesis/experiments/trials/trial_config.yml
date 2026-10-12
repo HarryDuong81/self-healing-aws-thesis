@@ -1,0 +1,94 @@
+# =============================================================================
+# experiments/trials/trial_config.yml — 60-trial S1 campaign configuration
+#
+# Defines the randomisation schedule, system-under-test assignment, fault
+# class distribution, and per-trial parameters for run_campaign.py.
+#
+# Trial protocol (Thesis §3.1.2, Table 3.2):
+#   S1 — Self-healing pipeline (MAPE-K + Ansible/Terraform):  60 trials
+#
+# S2 and S3 are both deliberately NOT executed by run_campaign.py, and are
+# not configured here — a previous revision of this file also carried an S3
+# block, consumed by run_campaign.py to build a 30-row S3 schedule, but that
+# schedule was always dispatched through run_one.py exactly like an S1 trial:
+# run_one.py's --system flag never selected different behaviour, and the
+# orchestrator always stamps system_under_test from its own SYSTEM_UNDER_TEST
+# env var (every real deployment defaults to "S1"). Every "S3" trial that
+# config produced was therefore a silently mislabelled S1 trial — the same
+# failure shape AD-016 already fixed for S2. Removed rather than fixed in
+# place, matching that precedent:
+#
+#   S2 (Manual SRE baseline) requires a human to perform the remediation with
+#   the orchestrator stopped, which an automated harness cannot do
+#   unattended. See experiments/trials/run_manual_trial.py; its results are
+#   recorded separately (results/mttr_log_s2.jsonl).
+#
+#   S3 (AWS Auto Scaling baseline) requires terraform/baseline to be applied
+#   first, and targets an ASG instance that inject_once.py's TargetName-based
+#   resolution cannot address at all. See experiments/trials/run_s3_trial.py;
+#   its results are recorded separately (results/mttr_log_s3.jsonl).
+#
+# Fault class distribution:
+#   Each of the 6 fault classes appears 10 times in S1 (60/6=10).
+#
+# Randomisation:
+#   Fault order within S1 is randomised using Python's random.shuffle with a
+#   fixed seed (RANDOM_SEED below) for reproducibility, grouped into 10
+#   blocks of 6 (one per fault class).
+# =============================================================================
+
+# ── Campaign identity ─────────────────────────────────────────────────────────
+campaign_id:   "ITS2024-150trial-v1"
+campaign_date: "2026-07-16"     # Planned start date — update before campaign run
+
+# ── Reproducibility seed ──────────────────────────────────────────────────────
+random_seed: 42                  # Fixed seed for trial order randomisation
+
+# ── Systems under test ────────────────────────────────────────────────────────
+systems:
+  S1:
+    name:        "Self-Healing Pipeline"
+    description: "MAPE-K closed-loop with Ansible/Terraform remediation"
+    trial_count: 60
+    faults:      [cpu_overload, memory_exhaustion, disk_saturation,
+                  service_crash, configuration_drift, instance_failure]
+    reps_per_fault: 10
+
+# ── Target assignment ─────────────────────────────────────────────────────────
+targets:
+  - target-1
+  - target-2
+  - target-3
+
+# Target rotation: faults are distributed round-robin across targets within
+# each system to avoid per-target learning effects.
+target_rotation: round_robin
+
+# ── Inter-trial interval ──────────────────────────────────────────────────────
+# Seconds to wait between trials to allow Prometheus alert rules to settle
+# and the system to return to steady state (all 6 fault_classes.yml rules FIRING=0).
+inter_trial_cooldown_seconds: 120
+
+# ── Fault injection parameters ────────────────────────────────────────────────
+fault_durations:
+  cpu_overload:        120    # stress-ng runtime; alert fires after 30 s
+  memory_exhaustion:   120
+  disk_saturation:     120
+  service_crash:       0      # instantaneous; NGINX stays down until remediated
+  configuration_drift: 0      # instantaneous; drift persists until remediated
+  instance_failure:    0      # API call; instance terminates immediately
+
+# ── Monitoring parameters ─────────────────────────────────────────────────────
+prometheus_url: "http://localhost:9090"
+alertmanager_url: "http://localhost:9093"
+
+# Per-trial MTTR recording SLO (Thesis RQ1)
+slo_seconds: 300
+
+# ── Output ────────────────────────────────────────────────────────────────────
+# JSON-Lines is the sole persistence format the thesis defines (Ch3 Table 3.5,
+# Ch4 Table 4.8) — no CSV mirror.
+output:
+  local_jsonl:   "results/mttr_log.jsonl"
+  s3_prefix:     "s3://its-thesis-data-<ACCOUNT_ID>/campaign/"  # unused by run_campaign.py (--out is authoritative); kept accurate for documentation
+  mirror_config: true    # mirror trial_config.yml to S3 alongside dataset

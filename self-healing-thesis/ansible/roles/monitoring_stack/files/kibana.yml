@@ -1,0 +1,126 @@
+# =============================================================================
+# ansible/roles/monitoring_stack/files/kibana.yml
+#
+# THE ACTUAL DEPLOY SOURCE (deployment-session correction, 2026-09-22,
+# CLAUDE.md §15.8's alert_rules.yml/kibana.yml path bug). This file is
+# deployed verbatim to kibana/kibana.yml by
+# ansible/roles/monitoring_stack/tasks/main.yml's "Deploy kibana.yml" task,
+# via a plain role-relative `src:` (Ansible's default files/ lookup), not
+# via a `{{ playbook_dir }}/../../observability/...` path.
+#
+# observability/kibana/kibana.yml is a synced reference copy only, kept for
+# `docker compose -f observability/docker-compose.yml` local/lint parity --
+# it is NOT what the monitoring_stack role reads. The two must be kept in
+# step by hand; nothing currently keeps them automatically synced (same
+# caveat as observability/docker-compose.yml's own header note for the
+# docker-compose.yml/.j2 split).
+#
+# Root cause this split fixes: the previous `{{ playbook_dir }}/../..` path
+# assumed `ansible/` and `observability/` are sibling directories, which is
+# true for a full repo checkout but false for the orchestrator's own scoped
+# host sync (`/opt/orchestrator`, AD-010) -- that directory deliberately
+# never included `observability/`. Running `deploy.yml --tags monitoring`
+# from `/opt/orchestrator` (the directory §15.3's own operational rule
+# points at) therefore failed at this exact task every time; a prior
+# session's successful deploy of this file must have run from
+# `/opt/self-healing-thesis` instead (a separate, less-current host copy
+# that does have `observability/`) -- confirmed live by that directory's
+# older file mtimes relative to `/opt/orchestrator`. Keeping the deploy
+# source inside the role's own `files/` directory removes the dependency on
+# which host directory happens to have `observability/` synced.
+# =============================================================================
+
+# =============================================================================
+# observability/kibana/kibana.yml — Memory-footprint-reduced configuration
+#
+# ELASTICSEARCH_HOSTS / xpack.security.enabled / SERVER_PUBLICBASEURL are set
+# via docker-compose environment variables (observability/docker-compose.yml),
+# not here — this file only disables features to fit Kibana's 9.4.1 real
+# startup memory footprint inside its container memory limit on the pinned
+# t3.medium monitoring host.
+#
+# Confirmed live: even with NODE_OPTIONS=--max-old-space-size=400 (a V8 heap
+# cap, which was itself a real and necessary fix — Kibana's default heap
+# sizing goes off the HOST's perceived total memory, not this container's
+# cgroup limit), Kibana still crash-looped with "JavaScript heap out of
+# memory" during its normal startup sequence. The heap cap was being
+# respected (crashes consistently occurred right at ~384-400MB) but Kibana's
+# actual minimum memory need to finish starting exceeded even that — a
+# genuine footprint problem, not a misconfigured ceiling. Disabling the
+# heavier optional plugins below is the first-pass attempt at reducing that
+# real footprint; may need iteration if still insufficient.
+#
+# 2026-09-22 update (CLAUDE.md §15.8): confirmed this plugin-disabling
+# config was already live and correctly deployed (it predates today's
+# investigation), yet Kibana still crash-looped even after the container
+# mem_limit was raised (512m→608m) and NODE_OPTIONS raised again
+# (400→500) — docker logs showed Kibana 9.4.1 still initializing 185
+# default plugins at startup regardless of the handful disabled here. Most
+# of that 185-plugin surface is not independently togglable via kibana.yml
+# at all (bundled into the standard distribution, unlike the individual
+# xpack.reporting/canvas toggles below). Kibana's instability remains a
+# known, accepted, non-blocking limitation (see the repo-layout note in
+# CLAUDE.md §2: "best-effort only... not a blocker for any RQ") — this file
+# reduces but does not eliminate it.
+# =============================================================================
+
+server.host: "0.0.0.0"
+
+# ── Disable memory/CPU-heavy solutions and plugins not used in this lab ─────
+xpack.reporting.enabled: false      # PDF/PNG report generation spins up a
+                                     # headless Chromium instance per report —
+                                     # by far the single heaviest optional
+                                     # feature; never used in this lab.
+xpack.canvas.enabled: false         # Workpad/presentation builder — unused.
+# xpack.maps.enabled removed - confirmed live: Kibana 9.4.1 has locked this
+# setting ("enabled status cannot be changed"); Maps is now always-bundled
+# and no longer independently togglable in this version. Not a memory win
+# we can claim here anymore; left disabled implicitly if Kibana does that
+# on its own, otherwise it's just part of the baseline footprint now.
+# xpack.ml.enabled, xpack.fleet.enabled, xpack.infra.enabled,
+# xpack.uptime.enabled, xpack.observability.enabled all removed - confirmed
+# live: xpack.ml.enabled hit the exact same "enabled status cannot be
+# changed" rejection as xpack.maps.enabled above. All five of these are
+# Kibana "solution"-level toggles (as opposed to xpack.reporting/canvas,
+# which are individual plugins) - given two-for-two confirmed locked, the
+# other three in this same category are removed proactively rather than
+# burning a redeploy cycle on each to confirm individually. They are
+# solution-level UI surfaces bundled into Kibana 9.4.1's distribution and
+# no longer independently disableable; not a memory win this file can claim.
+
+# ── Disable outbound calls to Elastic's own SaaS endpoints ──────────────────
+# Confirmed live: Kibana's bundled self-instrumentation APM agent was
+# actively configured to report to Elastic Cloud's own APM server
+# (kibana-cloud-apm.apm.us-east-1.aws.found.io) on every startup — pure
+# overhead for a private lab with no observability value to this project.
+#
+# contextPropagationOnly must be set to false alongside active: false —
+# confirmed live: leaving it at Kibana's own default (true) while active is
+# false is a contradictory combination the apm-config-loader rejects
+# outright at startup ("APM is disabled, but context propagation is
+# enabled"), crashing Kibana in ~1s, before it even reaches the plugin/heap
+# stage this file's other settings are meant to fix.
+elastic.apm.active: false
+elastic.apm.contextPropagationOnly: false
+telemetry.enabled: false
+telemetry.optIn: false
+newsfeed.enabled: false
+
+# ── Agent Builder (Kibana 9.x default-on plugin, new in this major version) ──
+# Discovered live in startup logs ("[plugins.agentBuilder] AgentBuilder
+# telemetry initialized") on the same run that got past the maps/ml
+# solution-lock errors below — never accounted for before now. Guessed
+# config key based on Kibana's `xpack.<solution>.enabled` naming convention;
+# unconfirmed against docs (no live access). May be rejected the same way
+# xpack.maps.enabled/xpack.ml.enabled were, may not exist as a toggle at
+# all, or may work as-is.
+xpack.agentBuilder.enabled: false
+
+# ── Encrypted Saved Objects (separate from the OOM investigation) ───────────
+# Confirmed live in startup logs: "Saved objects encryption key is not
+# set...API keys are being invalidated" / alerting and actions APIs disabled
+# without this. Not a memory fix - a functionality gap noticed in passing
+# while already in this file. Any random 32+ char string works; this one is
+# lab-only (xpack.security.enabled: false everywhere else in this project),
+# not protecting anything of real sensitivity.
+xpack.encryptedSavedObjects.encryptionKey: "cb9a780bf663ab11751e8d382b7102c5"

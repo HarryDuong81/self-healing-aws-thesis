@@ -1,0 +1,50 @@
+---
+# roles/common/tasks/main.yml — baseline setup for all hosts
+- name: Update apt cache
+  apt:
+    update_cache: yes
+    cache_valid_time: 3600
+
+- name: Install common packages
+  apt:
+    name:
+      - ca-certificates
+      - curl
+      - gnupg
+      - lsb-release
+      - unzip
+      - jq
+      - git
+      - htop
+      - vim
+      - python3
+      - python3-pip
+      - python3-venv
+      - awscli
+      - iproute2
+      - iptables
+    state: present
+
+- name: Set hostname
+  hostname:
+    name: "{{ inventory_hostname }}"
+
+- name: Set system timezone to UTC
+  community.general.timezone:
+    name: Etc/UTC
+
+- name: Create /opt/self-healing base directory
+  file:
+    path: /opt/self-healing
+    state: directory
+    owner: ubuntu
+    group: ubuntu
+    mode: "0755"
+
+- name: Create Ansible log directory
+  file:
+    path: /var/log/ansible
+    state: directory
+    owner: root
+    group: adm
+    mode: "0775"

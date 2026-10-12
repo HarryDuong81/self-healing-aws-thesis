@@ -1,0 +1,63 @@
+# ── Terraform ────────────────────────────────────────────────────────────────
+# Never commit tfvars — they contain account IDs, IPs, and email addresses
+terraform.tfvars
+terraform.tfvars.json
+*.auto.tfvars
+*.auto.tfvars.json
+
+# Terraform working directories and state
+**/.terraform/
+**/.terraform.lock.hcl
+*.tfstate
+*.tfstate.*
+*.tfplan
+crash.log
+crash.*.log
+
+# Backend config written by bootstrap/outputs.tf
+outputs.backend.tfvars
+
+# ── AWS credentials ───────────────────────────────────────────────────────────
+.aws/
+*.pem
+*.key
+
+# ── Python ───────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+env/
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+
+# ── Analysis results (large binary / generated) ───────────────────────────────
+results/*.jsonl
+results/*.json
+results/*.csv
+
+# ── OS / editor ───────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+.vscode/settings.json
+.idea/
+
+# ── Docker ────────────────────────────────────────────────────────────────────
+docker-compose.override.yml
+
+# ── Node (build scripts) ──────────────────────────────────────────────────────
+node_modules/
+package-lock.json
+
+# Python tooling caches
+.ruff_cache/
+
+# ── Ansible ──────────────────────────────────────────────────────────────────
+# Local ansible-galaxy collection/role cache — machine-local, potentially
+# large, and reinstalled from ansible/requirements.yml on any fresh checkout.
+.ansible/

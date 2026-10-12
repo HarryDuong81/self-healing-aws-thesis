@@ -1,0 +1,92 @@
+# =============================================================================
+# ansible/inventory/aws_ec2.yml — Dynamic EC2 inventory via aws_ec2 plugin
+#
+# Groups created:
+#   aws_ec2              — all EC2 instances in the VPC
+#   monitoring_host      — the t3.medium monitoring/orchestrator server
+#   target_nodes         — the three t3.micro target instances
+#   tag_NodeName_target_1, tag_NodeName_target_2, tag_NodeName_target_3
+#
+# Connection model:
+#   monitoring_host  → community.aws.aws_ssm (port 22 stays open on
+#                       sg-orchestrator for optional manual emergency access
+#                       only — Ansible automation never uses it, so a missing
+#                       key pair does not block the bootstrap play)
+#   target_nodes     → community.aws.aws_ssm (no inbound port 22 at all)
+#
+# The thesis (Ch3 §3.3.1) does not mandate SSH for monitoring_host — it only
+# describes the reverse-proxied 443 inbound rule and SSM Session Manager
+# tunnelling for operator Prometheus access. SSM for monitoring_host here is
+# a deployment-simplicity choice, not a cited thesis requirement.
+#
+# Runtime:
+#   ansible-playbook -i inventory/aws_ec2.yml ...
+#   ansible-inventory -i inventory/aws_ec2.yml --graph    (verify grouping)
+#
+# Requires:
+#   pip install boto3 botocore
+#   ansible-galaxy collection install community.aws
+#   AWS credentials in environment or instance profile
+# =============================================================================
+
+plugin: aws_ec2
+
+# ── Region ────────────────────────────────────────────────────────────────────
+regions:
+  - ap-southeast-1
+
+# ── Scope filter — only managed instances ─────────────────────────────────────
+filters:
+  "tag:Project":     self-healing-thesis
+  "tag:ManagedBy":   terraform
+  instance-state-name: running
+
+# ── Key-based host naming ─────────────────────────────────────────────────────
+# Use the EC2 private DNS name as the Ansible inventory hostname.
+# For SSM connections (both groups) the hostname itself is irrelevant —
+# community.aws.aws_ssm addresses instances by ec2_instance_id.
+hostnames:
+  - tag:Name
+  - private-dns-name
+
+# ── Group composition ─────────────────────────────────────────────────────────
+# Groups are derived from EC2 tags set by Terraform.
+# Workspace=bootstrap → monitoring_host
+# Workspace=targets   → target_nodes
+keyed_groups:
+  - key: tags.Workspace
+    prefix: ""
+    separator: ""
+  - key: tags.NodeName
+    prefix: "node"
+    separator: "_"
+
+groups:
+  monitoring_host: "'bootstrap' in tags.Workspace"
+  target_nodes:    "'targets'   in tags.Workspace"
+
+# ── Host variable injection ───────────────────────────────────────────────────
+# Expose useful EC2 metadata as Ansible host_vars.
+compose:
+  # EC2 instance ID — used by community.aws.aws_ssm connection plugin and
+  # by plan.py transport_validation() SSM PingStatus check.
+  ansible_host:           private_ip_address
+  ec2_instance_id:        instance_id
+  ec2_private_ip:         private_ip_address
+  ec2_public_ip:          public_ip_address | default('')
+  ec2_availability_zone:  placement.availability_zone
+  ec2_instance_type:      instance_type
+  node_name:              tags.NodeName | default('')
+
+# ── Connection variables per group ────────────────────────────────────────────
+# These are appended to the hostvars for matching hosts.
+# Per-group vars live in group_vars/<group_name>/vars.yml; the block below is
+# documentation of the expected values only.
+#
+# monitoring_host and target_nodes (both groups, identical connection model):
+#   ansible_connection:          community.aws.aws_ssm
+#   ansible_user:                ubuntu
+#   ansible_aws_ssm_bucket_name: <s3_bucket_name>
+#   ansible_aws_ssm_region:      ap-southeast-1
+#   ansible_aws_ssm_instance_id: "{{ ec2_instance_id }}"   (monitoring_host only;
+#     target_nodes resolves instance ID automatically from the aws_ec2 plugin)

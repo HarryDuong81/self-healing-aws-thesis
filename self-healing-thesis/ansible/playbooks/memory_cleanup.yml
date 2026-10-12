@@ -1,0 +1,152 @@
+---
+# ansible/playbooks/memory_cleanup.yml
+# =============================================================================
+# S2 (fault class 2) — Memory Exhaustion remediation (workflow v3 §9.1)
+#
+# Drops the page cache, kills the top memory consumer if not protected,
+# and restarts nginx.  Verifies free memory exceeds 20% threshold within 30 s.
+#
+# Actuator : Ansible
+# Transport: SSH :22 from the Monitoring Stack Server (which is itself the
+#            Ansible control node; execute.py runs ansible-playbook as a
+#            local subprocess).  SSM is retained elsewhere in the system --
+#            fault injection, the Plan-layer PingStatus liveness gate, and
+#            manual Session Manager access -- but is not this playbook's
+#            connection transport.
+# Scope    : One target, enforced by --limit <target>
+# Fault    : memory_exhaustion
+# =============================================================================
+
+- name: "Memory Exhaustion — Drop page cache and kill hungry processes"
+  hosts: "{{ target_host | default('all') }}"
+  become: yes
+  gather_facts: no
+
+  vars:
+    protected_processes:
+      - sshd
+      - ssh
+      - systemd
+      - snapd
+      - amazon-ssm-agent
+      - node_exporter
+      - ansible
+      - python
+      - python3
+    free_memory_threshold_pct: 20
+    # Deployment-session fix (2026-09-21): replaces the old single fixed
+    # verification_wait_s (30) pause -- see the "Wait for memory to clear"
+    # task's own comment for why. Same total worst-case budget style, just
+    # doubled (12 x 5s = 60s) and polled instead of checked once at the end.
+    mem_check_retries: 12
+    mem_check_poll_interval_s: 5
+
+  tasks:
+
+    - name: Record memory before cleanup
+      command: free -m
+      register: mem_before
+      changed_when: false
+
+    - name: Log memory before
+      debug:
+        msg: "{{ mem_before.stdout }}"
+
+    - name: Sync filesystem buffers
+      command: sync
+      changed_when: false
+
+    - name: Drop page cache (echo 3 > /proc/sys/vm/drop_caches)
+      shell: echo 3 > /proc/sys/vm/drop_caches
+      changed_when: true
+
+    - name: Identify top memory consumer
+      command: >
+        ps -eo pid,pmem,comm --sort=-pmem --no-headers
+      register: ps_output
+      changed_when: false
+
+    - name: Parse top memory consumer
+      set_fact:
+        top_pid:  "{{ ps_output.stdout_lines[0].split()[0] }}"
+        top_mem:  "{{ ps_output.stdout_lines[0].split()[1] }}"
+        top_comm: "{{ ps_output.stdout_lines[0].split()[2] }}"
+      when: ps_output.stdout_lines | length > 0
+
+    - name: Log top memory consumer
+      debug:
+        msg: "Top memory consumer: PID={{ top_pid }} MEM={{ top_mem }}% COMM={{ top_comm }}"
+
+    - name: Kill top memory consumer (if not protected)
+      shell: |
+        kill -9 {{ top_pid }}
+        echo "Killed PID {{ top_pid }} ({{ top_comm }}) consuming {{ top_mem }}% memory"
+      when:
+        - top_comm is defined
+        - top_comm not in protected_processes
+        - top_mem | float > 10
+      register: kill_result
+
+    - name: Restart nginx
+      systemd:
+        name: nginx
+        state: restarted
+
+    - name: Wait for memory to clear, polling rather than one fixed wait then one check
+      # Deployment-session fix (2026-09-21): the original design (a single fixed
+      # 30s pause, then one check with failed_when: mem_check.rc != 0) treated
+      # "not yet over threshold at exactly the 30s mark" as a hard playbook
+      # failure -- confirmed live, twice, on genuinely successful remediations
+      # (kill + restart correctly targeted the injected load) where memory
+      # simply took a bit longer than 30s to cross the threshold. That false
+      # failure forced execute.py's own retry loop to re-dispatch the entire
+      # playbook (a second kill + restart + wait cycle), pushing T_remediate
+      # past 85-146s -- long enough for Alertmanager's group_interval (30s,
+      # alertmanager.yml.j2) to re-flush the still-open alert group mid-
+      # remediation. The orchestrator has no way to distinguish that routine
+      # re-notification from a genuinely new occurrence, so it ran a second,
+      # fully redundant MAPE-K cycle against a target that had already
+      # recovered -- and twice in the same circuit-breaker window, that
+      # cascaded into a spurious circuit_breaker_open escalation, misreporting
+      # a single successful remediation as three separate events under one
+      # trial_id.
+      #
+      # This task now polls the same check every 5s for up to 60s (double the
+      # original fixed wait) rather than waiting once and checking once. Doing
+      # this within a single ansible-playbook dispatch -- not via execute.py's
+      # outer retry -- avoids repeating the kill+restart work and the SSH
+      # dispatch overhead for what is very plausibly just page-cache reclaim
+      # taking a little longer than 30s. It does not by itself guarantee
+      # T_remediate stays under Alertmanager's 30s group_interval -- a run
+      # that genuinely needs close to the full 60s budget can still overlap a
+      # re-flush. That is a separate, not-yet-addressed mismatch between
+      # group_interval and this playbook's worst-case remediation time.
+      shell: |
+        python3 -c "
+        with open('/proc/meminfo') as f:
+            lines = {l.split(':')[0]: int(l.split()[1]) for l in f if ':' in l}
+        total = lines.get('MemTotal', 1)
+        avail = lines.get('MemAvailable', 0)
+        pct   = avail * 100 // total
+        print(f'Free memory: {pct}%')
+        exit(0 if pct >= {{ free_memory_threshold_pct }} else 1)
+        "
+      register: mem_check
+      changed_when: false
+      until: mem_check.rc == 0
+      retries: "{{ mem_check_retries }}"
+      delay: "{{ mem_check_poll_interval_s }}"
+
+    - name: Verify /healthz endpoint
+      uri:
+        url: "http://localhost/healthz"
+        status_code: 200
+      retries: 6
+      delay: 5
+      register: health_check
+      until: health_check.status == 200
+
+    - name: Log remediation complete
+      command: >
+        logger -t self-healing
+        "REMEDIATE memory_exhaustion COMPLETE host={{ inventory_hostname }}"

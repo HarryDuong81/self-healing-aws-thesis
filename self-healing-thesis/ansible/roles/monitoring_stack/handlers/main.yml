@@ -1,0 +1,25 @@
+---
+# roles/monitoring_stack/handlers/main.yml
+- name: restart monitoring stack
+  community.docker.docker_compose_v2:
+    project_src: "{{ monitoring_base_dir }}"
+    state: present
+    recreate: always
+
+- name: reload prometheus
+  uri:
+    url: "http://localhost:{{ prometheus_port }}/-/reload"
+    method: POST
+    status_code: [200, 204]
+  ignore_errors: yes
+
+- name: reload alertmanager
+  uri:
+    url: "http://localhost:{{ alertmanager_port }}/-/reload"
+    method: POST
+    status_code: [200, 204]
+  ignore_errors: yes
+
+- name: daemon-reload
+  systemd:
+    daemon_reload: yes

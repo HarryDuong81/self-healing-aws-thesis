@@ -1,0 +1,109 @@
+---
+# =============================================================================
+# site.yml — Master Playbook (workflow v3)
+# Self-Healing Cloud Infrastructure | Ansible-First Remediation Actuators
+#
+# Workflow v3 Ansible-first routing (5 of 6 fault classes handled by Ansible):
+#   cpu_overload        → playbooks/kill_runaway_process.yml
+#   memory_exhaustion   → playbooks/memory_cleanup.yml
+#   disk_saturation     → playbooks/disk_cleanup.yml
+#   service_crash       → playbooks/service_crash.yml
+#   configuration_drift → playbooks/config_reapply.yml
+#   instance_failure    → Terraform only (workspace-scope apply, no -target)
+#
+# This file is used for:
+#   - Manual full-system remediation
+#   - Integration testing (ansible-playbook site.yml --tags verify)
+#   - Documentation of the complete remediation surface
+#
+# Usage (single fault class):
+#   ansible-playbook site.yml --tags cpu_overload --limit target-1
+#   ansible-playbook site.yml --tags disk_saturation
+#   ansible-playbook site.yml --tags configuration_drift --limit target-2
+#
+# Usage (verify only — no state changes):
+#   ansible-playbook site.yml --tags verify --check
+# =============================================================================
+
+# ── Fault class 1: cpu_overload ───────────────────────────────────────────────
+- name: "cpu_overload — kill runaway process"
+  import_playbook: playbooks/kill_runaway_process.yml
+  tags: [cpu_overload, ansible_remediation]
+
+# ── Fault class 2: memory_exhaustion ─────────────────────────────────────────
+- name: "memory_exhaustion — drop caches + kill top consumer"
+  import_playbook: playbooks/memory_cleanup.yml
+  tags: [memory_exhaustion, ansible_remediation]
+
+# ── Fault class 3: disk_saturation ───────────────────────────────────────────
+- name: "disk_saturation — tiered disk cleanup"
+  import_playbook: playbooks/disk_cleanup.yml
+  tags: [disk_saturation, ansible_remediation]
+
+# ── Fault class 4: service_crash ─────────────────────────────────────────────
+- name: "service_crash — restart nginx"
+  import_playbook: playbooks/service_crash.yml
+  tags: [service_crash, ansible_remediation]
+
+# ── Fault class 5: configuration_drift ───────────────────────────────────────
+- name: "configuration_drift — restore golden config"
+  import_playbook: playbooks/config_reapply.yml
+  tags: [configuration_drift, ansible_remediation]
+
+# ── Fault class 6: instance_failure (Terraform — reminder only) ──────────────
+- name: "instance_failure — Terraform only"
+  hosts: localhost
+  gather_facts: no
+  tags: [instance_failure]
+  tasks:
+    - name: Remind operator that instance_failure uses Terraform
+      debug:
+        msg: >
+          instance_failure remediation is handled by Terraform, not Ansible.
+          From the monitoring server:
+            cd /opt/orchestrator/terraform/targets
+            terraform apply -auto-approve
+
+# ── Verification — read-only health check ─────────────────────────────────────
+- name: "System health verification (read-only)"
+  hosts: targets
+  gather_facts: false
+  become: true
+  tags: [verify, health_check]
+
+  tasks:
+    - name: "VERIFY | Check nginx service state"
+      ansible.builtin.systemd:
+        name: nginx
+      register: nginx_state
+      changed_when: false
+
+    - name: "VERIFY | Check disk usage"
+      ansible.builtin.shell:
+        cmd: df / | awk 'NR==2 {print $5}' | tr -d '%'
+      register: disk_pct
+      changed_when: false
+
+    - name: "VERIFY | Check free memory"
+      ansible.builtin.shell:
+        cmd: free | awk '/^Mem:/ {printf "%.0f", $4/$2*100}'
+      register: mem_free_pct
+      changed_when: false
+
+    - name: "VERIFY | HTTP health endpoint"
+      ansible.builtin.uri:
+        url:         "http://{{ inventory_hostname }}/healthz"
+        method:      GET
+        status_code: 200
+        timeout:     5
+      register: http_check
+      changed_when: false
+
+    - name: "VERIFY | Summary"
+      ansible.builtin.debug:
+        msg:
+          - "nginx state:   {{ nginx_state.status.ActiveState }}"
+          - "disk used:     {{ disk_pct.stdout }}%"
+          - "mem free:      {{ mem_free_pct.stdout }}%"
+          - "HTTP /health:  {{ http_check.status }}"
+          - "Overall:       {{ 'HEALTHY' if nginx_state.status.ActiveState == 'active' and disk_pct.stdout | int < 90 and http_check.status == 200 else 'UNHEALTHY' }}"

@@ -1,0 +1,216 @@
+---
+# =============================================================================
+# ansible/playbooks/config_reapply.yml
+# Fault class 5 — configuration_drift (Thesis Table 3.3/3.4, Ch4 Table 4.5/4.7)
+#
+# Trigger  : Prometheus ConfigurationDrift (fault_type=configuration_drift,
+#             for:30s — fires when canonical_hash != running_hash, published
+#             by the config-drift-check.timer textfile-collector mechanism;
+#             observability/prometheus/rules/fault_classes.yml)
+# Actuator : Ansible
+# Transport: SSH :22 from the Monitoring Stack Server (which is itself the
+#            Ansible control node; execute.py runs ansible-playbook as a
+#            local subprocess).  SSM is retained elsewhere in the system --
+#            fault injection, the Plan-layer PingStatus liveness gate, and
+#            manual Session Manager access -- but is not this playbook's
+#            connection transport.
+# Scope    : One target, enforced by --limit <target>
+# Limit    : --limit <target-N>  (single faulted instance)
+#
+# ── What the fault injection does (experiments/inject/scenarios.yml) ─────────
+# The active injector (inject_once.py, driven by scenarios.yml's
+# configuration_drift entry) appends an invalid directive to
+# /etc/nginx/conf.d/healthz.conf via SSM RunCommand — the same file this
+# playbook restores below, and the same file the canonical_hash/running_hash
+# textfile-collector metric hashes (terraform/modules/compute/
+# user_data_target.sh.tpl). All three now agree on one file.
+#
+# ── Remediation algorithm ─────────────────────────────────────────────────────
+# 1. [GATHER]   Snapshot the drifted file's checksum for the audit log.
+# 2. [RESTORE]  Overwrite the drifted healthz.conf from the boot-time
+#               canonical snapshot already present on the target
+#               (/etc/nginx/conf.d/healthz.conf.canonical, written once by
+#               user_data at first boot) — the same canonical reference the
+#               drift-detection metric hashes, so remediation and detection
+#               can never disagree about what "canonical" means.
+# 3. [VALIDATE] Run `nginx -t`. Aborts before reload if the canonical
+#               snapshot itself is somehow invalid.
+# 4. [RELOAD]   systemctl reload nginx (graceful — no dropped connections).
+# 5. [VERIFY-DIFF] diff canonical vs live — spec requires this to be EMPTY.
+# 6. [VERIFY-HEALTH] HTTP GET localhost/healthz must return 200.
+# 7. [LOG]      Structured syslog entry for MTTR correlation.
+#
+# Out of scope: this playbook does not manage sshd_config. Targets do accept
+# inbound SSH on :22, but only from sg-orchestrator -- never from a
+# researcher CIDR or 0.0.0.0/0 -- so the listener is reachable solely by the
+# monitoring host. sshd hardening is owned by the security-group boundary
+# and the base image, not by this remediation playbook.
+#
+# Usage (orchestrator calls this automatically via execute.py):
+#   ansible-playbook ansible/playbooks/config_reapply.yml \
+#       --limit target-1 \
+#       --inventory ansible/inventory/aws_ec2.yml \
+#       --extra-vars "run_id=<uuid> trial_id=<id>"
+# =============================================================================
+
+- name: "Configuration Drift — Restore canonical healthz.conf"
+  hosts: "{{ target_host | default('all') }}"
+  become: yes
+  gather_facts: no   # minimise T_remediate; no host facts needed
+
+  vars:
+    healthz_conf:   /etc/nginx/conf.d/healthz.conf
+    canonical_conf: /etc/nginx/conf.d/healthz.conf.canonical
+    log_tag:        self-healing
+
+  tasks:
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # Phase 1 — State Gathering (pre-remediation audit snapshot)
+    # ══════════════════════════════════════════════════════════════════════════
+
+    - name: "[GATHER] Compute cksum of drifted healthz.conf"
+      command: "cksum {{ healthz_conf }}"
+      register: cksum_before
+      changed_when: false
+      failed_when: false
+
+    - name: "[GATHER] Log drifted state"
+      debug:
+        msg: "Pre-remediation cksum ({{ inventory_hostname }}): {{ cksum_before.stdout | default('unavailable') }}"
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # Phase 2 — Restore Canonical healthz.conf (full overwrite)
+    # ══════════════════════════════════════════════════════════════════════════
+    # remote_src: yes — the canonical snapshot already lives on the target
+    # (written once at first boot by user_data_target.sh.tpl), so this is a
+    # local file copy on the target itself, not a control-node push.
+    # ══════════════════════════════════════════════════════════════════════════
+
+    - name: "[RESTORE] Verify canonical snapshot exists on target"
+      stat:
+        path: "{{ canonical_conf }}"
+      register: canonical_stat
+      changed_when: false
+
+    - name: "[RESTORE] Fail fast if canonical snapshot is missing"
+      fail:
+        msg: >
+          {{ canonical_conf }} not found — target was not bootstrapped by
+          user_data_target.sh.tpl (Thesis §3.4.1). Cannot restore without a
+          canonical reference.
+      when: not canonical_stat.stat.exists
+
+    - name: "[RESTORE] Overwrite drifted healthz.conf from the canonical snapshot"
+      copy:
+        src:       "{{ canonical_conf }}"
+        dest:      "{{ healthz_conf }}"
+        remote_src: yes
+        owner:     root
+        group:     root
+        mode:      "0644"
+        backup:    yes   # creates healthz.conf.bak<timestamp>
+      register: restore_result
+
+    - name: "[RESTORE] Log restore result"
+      debug:
+        msg: "healthz.conf {{ 'restored (was drifted)' if restore_result.changed else 'already canonical (no change)' }}"
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # Phase 3 — nginx Configuration Syntax Validation
+    # ══════════════════════════════════════════════════════════════════════════
+
+    - name: "[VALIDATE] Test full nginx configuration with `nginx -t`"
+      command: nginx -t
+      register: nginx_test
+      changed_when: false
+      failed_when: nginx_test.rc != 0
+
+    - name: "[VALIDATE] Log nginx -t output"
+      debug:
+        msg: "{{ nginx_test.stderr_lines }}"   # nginx -t writes to stderr
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # Phase 4 — Service Reload
+    # ══════════════════════════════════════════════════════════════════════════
+
+    - name: "[RELOAD] Graceful nginx reload (applies new config, no dropped connections)"
+      systemd:
+        name:  nginx
+        state: reloaded
+      register: nginx_reloaded
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # Phase 4b — Force Immediate Drift-Metric Refresh
+    # ══════════════════════════════════════════════════════════════════════════
+    # canonical_hash/running_hash are only republished every 60s by the
+    # config-drift-check.timer (user_data_target.sh.tpl) - confirmed live:
+    # this playbook restores the file and reloads nginx in ~9s, but the
+    # orchestrator's canonical t_clear signal (the Prometheus ALERTS series
+    # the health-checker polls) only updates on that timer's
+    # NEXT scheduled tick, which can be up to 60s later - comfortably
+    # exceeding the 30s validation window nearly every run regardless of how
+    # fast remediation itself completes. Running the underlying script
+    # directly (the same one config-drift-check.service invokes) makes the
+    # metric reflect reality immediately instead of waiting on the timer.
+    # ══════════════════════════════════════════════════════════════════════════
+
+    - name: "[RELOAD] Force immediate canonical_hash/running_hash metric refresh"
+      command: /usr/local/bin/config_drift_check.sh
+      changed_when: false
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # Phase 5 — Drift Verification
+    # ══════════════════════════════════════════════════════════════════════════
+    # "verify that a diff between the live runtime configuration and the
+    # canonical version returns completely empty" (Thesis §3.6.1).
+    # ══════════════════════════════════════════════════════════════════════════
+
+    - name: "[VERIFY] Assert diff between canonical and live healthz.conf is EMPTY"
+      command: "diff -u {{ canonical_conf }} {{ healthz_conf }}"
+      register: conf_diff
+      changed_when: false
+      failed_when:  conf_diff.rc != 0
+      # rc=0: no diff — canonical restored successfully.
+      # rc=1: diff found — restoration incomplete.
+      # rc=2: error (file not found etc.) — fail unconditionally.
+
+    - name: "[VERIFY] Log drift verification result"
+      debug:
+        msg: "healthz.conf diff: EMPTY (canonical restored)"
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # Phase 6 — Service Health Verification
+    # ══════════════════════════════════════════════════════════════════════════
+
+    - name: "[VERIFY] Confirm nginx /healthz endpoint responds HTTP 200"
+      uri:
+        url:         "http://localhost/healthz"
+        method:      GET
+        status_code: 200
+        timeout:     5
+      register: health_probe
+      until:    health_probe.status == 200
+      retries:  6
+      delay:    5
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # Phase 7 — Post-Remediation Log
+    # ══════════════════════════════════════════════════════════════════════════
+
+    - name: "[LOG] Compute cksum of restored healthz.conf"
+      command: "cksum {{ healthz_conf }}"
+      register: cksum_after
+      changed_when: false
+
+    - name: "[LOG] Write structured completion record to syslog"
+      command: >
+        logger -t {{ log_tag }}
+        "REMEDIATE_COMPLETE fault=configuration_drift status=success
+         host={{ inventory_hostname }}
+         changed={{ restore_result.changed }}
+         cksum_before={{ cksum_before.stdout.split() | first | default('n/a') }}
+         cksum_after={{ cksum_after.stdout.split() | first }}
+         nginx_health={{ health_probe.status }}
+         run_id={{ run_id | default('n/a') }}"
+      changed_when: false

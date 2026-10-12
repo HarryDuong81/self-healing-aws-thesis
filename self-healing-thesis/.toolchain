@@ -1,0 +1,19 @@
+# .toolchain — Pinned versions for `make verify-pins`
+# CRITICAL: These versions are cited in Thesis Chapter 4 Table 4.2.
+# Do NOT change without bumping the thesis .
+terraform=1.14.9
+ansible-core=2.17
+community-aws=9
+python=3.14
+ruff=0.12.10
+docker=28.5
+docker-compose=2.24
+prometheus=3.11.3
+alertmanager=0.32.1
+grafana=13.0
+elasticsearch=9.4.1
+logstash=9.4.1
+kibana=9.4.1
+otelcol=0.152.0
+jaeger=2.18.0
+cadvisor=0.49.1

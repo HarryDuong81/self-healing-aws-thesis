@@ -1,0 +1,57 @@
+---
+# ansible/inventory/group_vars/monitoring_host/vars.yml
+# Connection vars for the monitoring/orchestrator server — SSM (no SSH key
+# pair required). Port 22 remains open on sg-orchestrator for optional
+# manual emergency access only (terraform/README.md PF-2); it is not used
+# by automated Ansible runs, so a missing/empty key_pair_name does not
+# block the bootstrap play.
+ansible_connection:          community.aws.aws_ssm
+# NOT "ubuntu": several tasks (e.g. roles/self_healing's `terraform init`)
+# use `become_user: ubuntu` to de-escalate from root. Ansible silently SKIPS
+# escalation whenever the declared ansible_user matches the requested
+# become_user, regardless of the actual connecting identity — confirmed
+# live: with ansible_user: ubuntu, `become_user: ubuntu` tasks ran as
+# ssm-user instead, causing "permission denied" writing into
+# ubuntu-owned .terraform/ directories. ansible_user's value has no other
+# effect here (SSM always connects as ssm-user regardless — see note below),
+# so any non-"ubuntu"/non-"root" value avoids the collision.
+ansible_user:                ssm-user
+ansible_aws_ssm_region:      ap-southeast-1
+ansible_aws_ssm_bucket_name: "{{ lookup('env','SSM_BUCKET') | default('REPLACE_S3_BUCKET_NAME', true) }}"
+ansible_aws_ssm_instance_id: "{{ ec2_instance_id }}"
+ansible_aws_ssm_timeout:     660
+# SSM sessions actually authenticate as the AWS-managed "ssm-user" OS account,
+# regardless of ansible_user above (the aws_ssm plugin does not honour it for
+# session identity). Ansible's default remote_tmp (~/.ansible/tmp) expands
+# against the DECLARED ansible_user, producing /home/ubuntu/.ansible/tmp —
+# a path ssm-user cannot write to ("mkdir: Permission denied" on every task).
+# Force a universally-writable temp path instead. Use $(whoami), not ${USER} —
+# $USER was observed to be a stale/misconfigured env var on this session that
+# does not reflect the actual connecting identity (confirmed via a live
+# `whoami` module run returning "ssm-user" while $USER expanded to "root").
+ansible_remote_tmp:          /tmp/.ansible-$(whoami)
+
+# ── Orchestrator env (rendered by roles/self_healing → orchestrator.env.j2) ───
+# DYNAMODB_LOCK_TABLE is required by the Plan layer's stale-lock precondition
+# and has no safe default — the template falls back to the
+# literal string "REPLACE_DYNAMODB_TABLE" if unset, which is not a real table
+# and makes the DynamoDB lock check silently degrade. Set via the same
+# lookup('env', ...) pattern already used for SSM_BUCKET below: export
+# DYNAMODB_LOCK_TABLE before running the playbook, e.g.
+#   export DYNAMODB_LOCK_TABLE=$(terraform -chdir=../terraform/bootstrap output -raw dynamodb_table_name)
+dynamodb_lock_table: "{{ lookup('env','DYNAMODB_LOCK_TABLE') | default('REPLACE_DYNAMODB_TABLE', true) }}"
+
+# SNS_TOPIC_ARN is read by orchestrator/app.py's _escalate() to publish human
+# escalation notifications (circuit_breaker_open, retry_exhausted, etc. —
+#). _escalate only calls sns.publish `if topic_arn:` — an
+# EMPTY value would make it silently skip the publish and only log CRITICAL
+# locally, which is exactly the bug this fixes (confirmed live: a
+# ServiceCrash alert sat unremediated for 12+ hours with zero notification
+# because this var didn't exist anywhere in the template). Default to an
+# obviously-fake placeholder instead of empty, so a forgotten export fails
+# LOUDLY (sns.publish raises, "SNS publish failed" gets logged) rather than
+# going quiet again. Set via the same lookup('env', ...) pattern as
+# DYNAMODB_LOCK_TABLE above: export SNS_TOPIC_ARN before running the
+# playbook, e.g.
+#   export SNS_TOPIC_ARN=$(terraform -chdir=../terraform/bootstrap output -raw sns_topic_arn)
+sns_topic_arn: "{{ lookup('env','SNS_TOPIC_ARN') | default('REPLACE_SNS_TOPIC_ARN', true) }}"

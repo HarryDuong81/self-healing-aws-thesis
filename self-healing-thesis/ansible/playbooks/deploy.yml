@@ -1,0 +1,66 @@
+---
+# ansible/playbooks/deploy.yml
+# Full deployment: common → monitoring stack → orchestrator → target nodes
+#
+# Usage:
+#   ansible-playbook playbooks/deploy.yml
+#   ansible-playbook playbooks/deploy.yml --tags monitoring
+#   ansible-playbook playbooks/deploy.yml --limit target_nodes
+# =============================================================================
+
+# Play 1 — common baseline on all hosts
+- name: Common baseline setup
+  hosts: all
+  become: yes
+  gather_facts: yes
+  tags: [common, always]
+  roles:
+    - common
+
+# Play 2 — monitoring stack (Docker Compose) on monitoring server
+- name: Deploy monitoring stack
+  hosts: monitoring_host
+  become: yes
+  gather_facts: yes
+  tags: [monitoring, stack]
+  roles:
+    - monitoring_stack
+
+# Play 3 — Flask orchestrator (systemd service) on monitoring server
+- name: Deploy self-healing orchestrator
+  hosts: monitoring_host
+  become: yes
+  gather_facts: yes
+  tags: [orchestrator, self_healing]
+  roles:
+    - self_healing
+
+# Play 4 — target node diagnostic agents
+#
+# Detection-path components (SSM Agent, NGINX + /healthz, Node Exporter,
+# CloudWatch Agent) are installed by the compute module's user_data at first
+# boot and are NOT re-applied here.  This play covers the diagnostic path only,
+# using the same roles diagnostic_agents.yml runs after an instance_failure
+# recreation, so the two paths cannot diverge.
+#
+# roles/target_node is deliberately not used: it installs Filebeat from the
+# Elastic 8.x repository via the deprecated apt_key module, which would
+# downgrade the 9.4.1 agent that roles/filebeat installs through a signed-by
+# keyring.  It is retained in the tree only as superseded reference.
+- name: Configure target node diagnostic agents
+  hosts: target_nodes
+  become: yes
+  gather_facts: yes
+  tags: [targets, nodes]
+  # roles/filebeat and roles/otel_collector both require the caller to
+  # define monitoring_host_ip (see their own tasks/main.yml comments).
+  # bootstrap.yml and diagnostic_agents.yml already set this before
+  # invoking the same roles; this play never did, confirmed live:
+  # 'monitoring_host_ip' is undefined, failing "Filebeat | Write
+  # configuration" on every target.
+  vars:
+    monitoring_host_ip: "{{ hostvars[groups['monitoring_host'][0]]['ec2_private_ip'] | default('127.0.0.1') }}"
+  roles:
+    - apt_lock_guard
+    - filebeat
+    - otel_collector

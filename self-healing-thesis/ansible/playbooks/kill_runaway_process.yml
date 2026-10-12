@@ -1,0 +1,343 @@
+---
+# =============================================================================
+# ansible/playbooks/kill_runaway_process.yml
+# Fault class 1 — cpu_overload (workflow v3 §9.1)
+#
+# Trigger  : Prometheus CPUHighAlert (fault_type=cpu_overload, for:60s)
+# Actuator : Ansible
+# Transport: SSH :22 from the Monitoring Stack Server (which is itself the
+#            Ansible control node; execute.py runs ansible-playbook as a
+#            local subprocess).  SSM is retained elsewhere in the system --
+#            fault injection, the Plan-layer PingStatus liveness gate, and
+#            manual Session Manager access -- but is not this playbook's
+#            connection transport.
+# Scope    : One target, enforced by --limit <target>
+# Limit    : --limit <target-N>  (single faulted instance)
+#
+# MAPE-K phase this playbook implements:
+#   Execute: identifies top CPU consumer, kills the rogue process group,
+#            optionally restarts nginx, and verifies recovery.
+#
+# Remediation algorithm:
+#   1. [GATHER]   Capture ps output and /proc/loadavg pre-remediation.
+#   2. [CLASSIFY] Identify top CPU consumer; check against protected allowlist.
+#   3. [REMEDIATE-KILL]   SIGKILL the top PID.
+#                         Then sweep for remaining sibling processes by comm
+#                         name — stress-ng spawns N worker processes (one per
+#                         vCPU); killing only the first worker leaves the rest
+#                         running and CPU stays elevated.
+#   4. [REMEDIATE-NGINX]  Restart nginx if it was the elevated process or is
+#                         no longer active.
+#   5. [VERIFY]   Poll /proc/loadavg in an until/retries/delay loop.
+#                 Pass criterion: normalised load (load1/nproc × 100) < 80 %.
+#                 Max wait: 12 retries × 5 s = 60 s.
+#   6. [VERIFY]   HTTP GET localhost/health must return 200.
+#   7. [LOG]      Write structured syslog entry for MTTR correlation.
+#
+# Protected allowlist rationale:
+#   Processes on the allowlist are infrastructure-critical.  Killing any of
+#   them would destabilise the instance, sever the SSH remediation channel or
+#   the SSM management channel used for injection and liveness gating,
+#   making subsequent Ansible plays impossible and invalidating the trial.
+#
+# CPU verification metric — why load average, not ps %cpu:
+#   ps %cpu is a weighted moving average since process start; it can lag by
+#   minutes and is per-core (can exceed 100 on multi-vCPU instances).
+#   /proc/loadavg load1 is the 1-minute exponential moving average of run-queue
+#   length.  Normalised against nproc: load1/nproc × 100 gives a stable,
+#   comparable "% of total CPU capacity" that clears quickly once stress-ng
+#   is dead.
+#
+# Usage (orchestrator calls this automatically via execute.py):
+#   ansible-playbook ansible/playbooks/kill_runaway_process.yml \
+#       --limit target-2 \
+#       --inventory ansible/inventory/aws_ec2.yml \
+#       --extra-vars "run_id=<uuid> trial_id=<id>"
+# =============================================================================
+
+- name: "CPU Overload — Identify and kill rogue process"
+  hosts: "{{ target_host | default('all') }}"
+  become: yes
+  gather_facts: no   # minimise T_remediate; nproc obtained via shell inline
+
+  vars:
+    # ── Protected process allowlist ───────────────────────────────────────────
+    # Any process whose comm field matches an entry in this list will NOT be
+    # killed, regardless of CPU consumption.  The playbook will log a warning
+    # and proceed to the verification phase without taking kill action.
+    protected_processes:
+      - sshd
+      - ssh
+      - systemd
+      - systemd-journald
+      - systemd-udevd
+      - systemd-resolved
+      - snapd
+      - amazon-ssm-agent
+      - ssm-agent-worker
+      - ssm-session-worker
+      - node_exporter
+      - filebeat
+      - ansible
+      - ansible-playbook
+      - python
+      - python3
+      # nginx is on the allowlist here: we restart it separately rather than
+      # killing it with SIGKILL (graceful vs. abrupt termination).
+      - nginx
+
+    # Single-process CPU % threshold.  stress-ng workers on t3.micro each
+    # consume ~100 % of one vCPU.  Any process consuming > 50 % is suspect.
+    rogue_cpu_threshold_pct: 50
+
+    # Post-kill recovery criterion: normalised load (load1/nproc × 100) < 80 %.
+    # t3.micro has 2 vCPU; idle load1 ≈ 0.05.  After stress-ng death,
+    # load1 drops within 15–30 s.
+    post_kill_load_threshold_pct: 80
+
+    # Verification loop timing: 12 × 5 s = max 60 s.
+    # The until loop exits early as soon as the criterion passes.
+    verify_retries: 12
+    verify_delay_s: 5
+
+    # Syslog tag — grep this in /var/log/syslog to correlate with MTTR records.
+    log_tag: self-healing
+
+  tasks:
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # Phase 1 — State Gathering
+    # ══════════════════════════════════════════════════════════════════════════
+
+    - name: "[GATHER] Capture top 5 CPU consumers (descending %cpu)"
+      command: >
+        ps -eo pid,ppid,pcpu,pmem,comm --sort=-pcpu --no-headers
+      register: ps_top
+      changed_when: false
+      # ps never modifies system state; changed_when: false prevents spurious
+      # "changed" status in the MTTR log.
+
+    - name: "[GATHER] Capture current 1-minute load average from /proc/loadavg"
+      command: awk '{print $1}' /proc/loadavg
+      register: load_avg_pre
+      changed_when: false
+
+    - name: "[GATHER] Capture number of logical CPUs (vCPU)"
+      command: nproc
+      register: nproc_raw
+      changed_when: false
+
+    - name: "[GATHER] Log pre-remediation system state"
+      debug:
+        msg: |
+          === Pre-Remediation State ({{ inventory_hostname }}) ===
+          Load average (1 min) : {{ load_avg_pre.stdout }}
+          vCPU count           : {{ nproc_raw.stdout }}
+          Normalised load      : {{ ((load_avg_pre.stdout | float) /
+                                     (nproc_raw.stdout | int) * 100) | round(1) }}%
+          Top 5 CPU consumers  :
+          {% for line in ps_top.stdout_lines[:5] %}
+            {{ line }}
+          {% endfor %}
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # Phase 2 — Process Classification
+    # ══════════════════════════════════════════════════════════════════════════
+
+    - name: "[CLASSIFY] Parse top CPU consumer from ps output"
+      set_fact:
+        top_pid:  "{{ ps_top.stdout_lines[0].split()[0] }}"
+        top_ppid: "{{ ps_top.stdout_lines[0].split()[1] }}"
+        top_cpu:  "{{ ps_top.stdout_lines[0].split()[2] }}"
+        top_comm: "{{ ps_top.stdout_lines[0].split()[4] }}"
+      when: ps_top.stdout_lines | length > 0
+
+    - name: "[CLASSIFY] Determine whether top consumer is a rogue process"
+      set_fact:
+        is_rogue: >-
+          {{ (top_cpu | float) >= rogue_cpu_threshold_pct
+             and top_comm not in protected_processes }}
+        is_nginx_elevated: "{{ top_comm == 'nginx' }}"
+      when: top_pid is defined
+
+    - name: "[CLASSIFY] Log classification decision"
+      debug:
+        msg: |
+          Process    : PID={{ top_pid }} PPID={{ top_ppid }}
+                       COMM={{ top_comm }} CPU={{ top_cpu }}%
+          Protected  : {{ top_comm in protected_processes }}
+          Rogue      : {{ is_rogue | default(false) }}
+          Threshold  : {{ rogue_cpu_threshold_pct }}%
+          Action     : {% if is_rogue | default(false) %}SIGKILL{% elif
+                          is_nginx_elevated | default(false) %}RESTART nginx{% else
+                          %}NONE (below threshold or protected){% endif %}
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # Phase 3a — Kill Rogue Process Group
+    # ══════════════════════════════════════════════════════════════════════════
+
+    - name: "[REMEDIATE] Kill rogue process group"
+      when: is_rogue | default(false) | bool
+      block:
+
+        - name: "[REMEDIATE] SIGKILL top rogue PID {{ top_pid }} ({{ top_comm }})"
+          command: "kill -9 {{ top_pid }}"
+          register: kill_primary
+          # rc=1 means process already exited between ps and kill — acceptable.
+          failed_when: kill_primary.rc not in [0, 1]
+          changed_when: kill_primary.rc == 0
+
+        - name: "[REMEDIATE] Sweep remaining sibling processes by comm name"
+          # stress-ng spawns one worker per vCPU.  Killing only the top process
+          # leaves siblings running.  pgrep -x matches the exact comm field so
+          # we do not accidentally kill unrelated processes with similar names.
+          shell: |
+            set -euo pipefail
+            REMAINING=$(pgrep -x "{{ top_comm }}" 2>/dev/null | grep -v -w "$PPID" || true)
+            if [ -n "$REMAINING" ]; then
+              echo "Sending SIGKILL to sibling PIDs: ${REMAINING}"
+              # shellcheck disable=SC2086 — word splitting intentional for PIDs
+              kill -9 ${REMAINING} 2>/dev/null || true
+              echo "Killed {{ top_comm }} process group."
+            else
+              echo "No remaining '{{ top_comm }}' processes found after primary kill."
+            fi
+          register: sibling_sweep
+          changed_when: "'Killed' in sibling_sweep.stdout"
+
+        - name: "[LOG] Record kill action to syslog"
+          command: >
+            logger -t {{ log_tag }}
+            "REMEDIATE fault=cpu_overload action=SIGKILL
+             host={{ inventory_hostname }}
+             pid={{ top_pid }} comm={{ top_comm }} cpu={{ top_cpu }}%
+             run_id={{ run_id | default('n/a') }}"
+          changed_when: false
+
+      rescue:
+        # The process may have exited between ps and kill (race condition).
+        # This is benign — log it and proceed to the verification phase.
+        - name: "[RESCUE] Process {{ top_pid }} ({{ top_comm }}) already exited — continuing"
+          debug:
+            msg: >
+              Kill of PID {{ top_pid }} ({{ top_comm }}) failed — process likely
+              exited spontaneously before SIGKILL was delivered.  Proceeding to
+              verification.
+
+    - name: "[SKIP] Log reason for not killing (below threshold or protected)"
+      debug:
+        msg: >
+          No kill action taken.
+          COMM={{ top_comm }} CPU={{ top_cpu }}%
+          Reason: {% if top_comm in protected_processes %}process is on protected allowlist
+                  {% else %}CPU below rogue threshold ({{ rogue_cpu_threshold_pct }}%){% endif %}
+      when: not (is_rogue | default(false) | bool)
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # Phase 3b — Nginx Recovery
+    # ══════════════════════════════════════════════════════════════════════════
+
+    - name: "[REMEDIATE] Check nginx service state"
+      command: systemctl is-active nginx
+      register: nginx_state
+      changed_when: false
+      failed_when: false   # rc=3 when inactive — not a fatal error here
+
+    - name: "[REMEDIATE] Restart nginx if it was elevated or is no longer active"
+      systemd:
+        name: nginx
+        state: restarted
+        enabled: yes
+      when: >
+        (is_nginx_elevated | default(false) | bool)
+        or nginx_state.rc != 0
+      register: nginx_restarted
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # Phase 4 — CPU Recovery Verification Loop (until / retries / delay)
+    # ══════════════════════════════════════════════════════════════════════════
+    # Spec §3.3: "Run an inspection loop (until/retries/delay) to verify that
+    # the target's overall CPU usage drops below the safety threshold within
+    # 30 seconds."
+    #
+    # Implementation uses /proc/loadavg (1-minute EMA of run-queue depth) rather
+    # than ps %cpu.  Normalisation: load1 / nproc × 100.
+    # The loop retries every 5 s for up to 60 s to account for load-average
+    # lag (EMA smoothing means load1 lags ~15 s behind instantaneous CPU drop).
+    # ══════════════════════════════════════════════════════════════════════════
+
+    - name: "[VERIFY] Wait for normalised CPU load to drop below {{ post_kill_load_threshold_pct }}%"
+      # Must be `|` (literal), not `>` (folded) — folding collapses the
+      # embedded Python script's newlines into spaces, concatenating every
+      # statement onto one line with no separators (guaranteed SyntaxError).
+      shell: |
+        python3 -c "
+        import sys
+        load1 = float(open('/proc/loadavg').read().split()[0])
+        nproc = int(open('/proc/cpuinfo').read().count('processor'))
+        nproc = max(nproc, 1)
+        normalised = (load1 / nproc) * 100
+        threshold  = {{ post_kill_load_threshold_pct }}
+        print(f'load1={load1:.2f} nproc={nproc} normalised={normalised:.1f}% threshold={threshold}%')
+        sys.exit(0 if normalised < threshold else 1)
+        "
+      register: cpu_verify
+      until: cpu_verify.rc == 0
+      retries: "{{ verify_retries }}"
+      delay:   "{{ verify_delay_s }}"
+      changed_when: false
+      failed_when: cpu_verify.rc != 0   # exhausted retries without passing
+
+    - name: "[VERIFY] Log CPU recovery result"
+      debug:
+        msg: "CPU recovery verified: {{ cpu_verify.stdout }}"
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # Phase 5 — Service Health Verification
+    # ══════════════════════════════════════════════════════════════════════════
+
+    - name: "[VERIFY] Confirm nginx /healthz endpoint responds HTTP 200"
+      uri:
+        url:         "http://localhost/healthz"   # Thesis §3.7.2 — canonical Stage E3 path
+        method:      GET
+        status_code: 200
+        timeout:     5
+      register: health_probe
+      until:    health_probe.status == 200
+      retries:  6
+      delay:    5
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # Phase 6 — Post-Remediation Log
+    # ══════════════════════════════════════════════════════════════════════════
+
+    - name: "[LOG] Capture post-remediation load average"
+      command: awk '{print $1}' /proc/loadavg
+      register: load_avg_post
+      changed_when: false
+
+    - name: "[LOG] Write structured completion record to syslog"
+      command: >
+        logger -t {{ log_tag }}
+        "REMEDIATE_COMPLETE fault=cpu_overload status=success
+         host={{ inventory_hostname }}
+         killed={{ top_comm | default('none') }}
+         load_before={{ load_avg_pre.stdout }}
+         load_after={{ load_avg_post.stdout }}
+         nginx_healthz={{ health_probe.status }}
+         run_id={{ run_id | default('n/a') }}
+         trial_id={{ trial_id | default('n/a') }}"
+      changed_when: false
+
+    - name: "[LOG] Record final remediation summary"
+      debug:
+        msg: |
+          === Remediation Complete ({{ inventory_hostname }}) ===
+          Fault class     : cpu_overload
+          Priority weight : 60  (Priority Matrix P — Thesis §3.5.1)
+          Action taken    : SIGKILL {{ top_comm | default('none') }}
+          Load before     : {{ load_avg_pre.stdout }}
+          Load after      : {{ load_avg_post.stdout }}
+          Health (/healthz): HTTP {{ health_probe.status }}
+          Run ID          : {{ run_id | default('n/a') }}
+          Trial ID        : {{ trial_id | default('n/a') }}

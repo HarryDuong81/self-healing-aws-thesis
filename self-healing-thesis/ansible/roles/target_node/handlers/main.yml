@@ -1,0 +1,22 @@
+---
+# roles/target_node/handlers/main.yml
+- name: reload nginx
+  systemd:
+    name: nginx
+    state: reloaded
+
+- name: restart nginx
+  systemd:
+    name: nginx
+    state: restarted
+
+- name: restart node_exporter
+  systemd:
+    name: node_exporter
+    state: restarted
+    daemon_reload: yes
+
+- name: restart filebeat
+  systemd:
+    name: filebeat
+    state: restarted

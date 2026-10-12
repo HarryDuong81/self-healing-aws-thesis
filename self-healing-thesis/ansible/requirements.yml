@@ -1,0 +1,38 @@
+---
+# ansible/requirements.yml — Galaxy collection manifest.
+#
+# Single source of truth for the collections this tree needs. Both CI
+# (.github/workflows/ci.yml) and the CD path (deploy.yml's SSM script, which
+# builds /opt/deploy-venv on the monitoring host) install from this file, so
+# the two cannot drift apart.
+#
+# It exists because they had drifted: community.docker was referenced by
+# roles/monitoring_stack but installed by neither, which would have failed the
+# observability-stack deploy on the monitoring host rather than in CI.
+#
+# Where each is used:
+#   amazon.aws        inventory/aws_ec2.yml (aws_ec2 plugin);
+#                     group_vars/monitoring_host (aws_ssm connection)
+#   community.aws     aws_ssm connection plugin
+#   community.docker  roles/monitoring_stack -> community.docker.docker_compose_v2
+#   community.general roles/common -> community.general.timezone;
+#                     ansible.cfg -> community.general.yaml callback
+#
+# amazon.aws and community.aws are pinned to the 9.x line recorded in
+# .toolchain (`community-aws=9`) and Ch.4 Table 4.2. community.docker and
+# community.general are not yet version-pinned: the versions currently on the
+# monitoring host have not been recorded, and pinning to an unverified value
+# would be a worse reproducibility claim than leaving it open. Capture the
+# deployed versions with `ansible-galaxy collection list` on the monitoring
+# host and pin them here before the campaign, then add both to .toolchain.
+
+collections:
+  - name: amazon.aws
+    version: ">=9.0.0,<10.0.0"
+
+  - name: community.aws
+    version: ">=9.0.0,<10.0.0"
+
+  - name: community.docker
+
+  - name: community.general

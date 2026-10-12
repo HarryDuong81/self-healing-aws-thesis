@@ -1,0 +1,34 @@
+---
+# ansible/inventory/group_vars/target_nodes/vars.yml
+# Connection vars for the three target EC2 instances.
+#
+# SSH (deliberate reversal of the thesis's no-SSH-on-targets invariant,
+#): switched from community.aws.aws_ssm after confirming
+# a reproducible AWS Session Manager defect — the aws_ssm connection
+# plugin's interactive session reliably starts remote command execution
+# (verbose trace shows "Begin marker received") but the completion message
+# is never delivered back over the session WebSocket, even though strace
+# confirms the local session-manager-plugin process is alive and correctly
+# polling for the awaited data. Isolated via minimal reproduction (single
+# `command` task, no Ansible playbook complexity) and ruled out every local
+# cause: IAM/S3 permissions, ansible-core/collection version, orphaned
+# sessions, system load, target OS/sudo/Python (all individually confirmed
+# fine). Port 22 is now open on sg-targets, scoped to sg-orchestrator only
+# (see terraform/modules/networking/main.tf), with a Terraform-generated
+# key pair (terraform/bootstrap/main.tf: tls_private_key.target_ssh).
+# Fault detection/injection is unaffected — inject_once.py still uses SSM
+# SendCommand (RunCommand), which was independently confirmed 100%
+# reliable throughout this debugging. Only Ansible's own remediation
+# dispatch connection changed.
+ansible_connection:          ssh
+ansible_user:                ubuntu
+# The inventory's compose block sets ansible_host: private_ip_address, but
+# that was never actually exercised before this change — the aws_ssm
+# connection plugin addresses instances by ec2_instance_id, not host/IP, so
+# a broken ansible_host would have gone unnoticed. Confirmed live: SSH tried
+# to resolve the tag:Name-based inventory hostname itself ("Could not
+# resolve hostname self-healing-thesis-experiment-target-1") instead of
+# using an IP. Set explicitly here as a safety net.
+ansible_host:                "{{ ec2_private_ip }}"
+ansible_ssh_private_key_file: "{{ orchestrator_base_dir | default('/opt/orchestrator') }}/.ssh/target_ssh_key.pem"
+ansible_ssh_common_args:     "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"

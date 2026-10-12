@@ -1,0 +1,53 @@
+---
+# roles/self_healing/defaults/main.yml
+# Previously undefined anywhere — deploy.yml's "Deploy self-healing
+# orchestrator" play has no vars: block, and this role had no defaults/
+# directory at all. Confirmed live: "'orchestrator_base_dir' is undefined"
+# on the very first templated task. Values below mirror the equivalent vars
+# already used successfully in ansible/bootstrap.yml and the actual
+# terraform/bootstrap defaults (project, environment, region).
+
+# ── Orchestrator directory layout (matches bootstrap.yml's vars) ──────────────
+orchestrator_base_dir: /opt/orchestrator
+orchestrator_src:      "{{ orchestrator_base_dir }}/src"
+orchestrator_venv:     "{{ orchestrator_base_dir }}/venv"
+orchestrator_results:  "{{ orchestrator_base_dir }}/results"
+orchestrator_logs:     "{{ orchestrator_base_dir }}/logs"
+
+# Port 9094 — Thesis Table 4.3. Do NOT change to 5000 (see orchestrator.env.j2).
+orchestrator_port: 9094
+
+# ── AWS / project identity (terraform/bootstrap/variables.tf defaults) ────────
+aws_region:  ap-southeast-1
+project:     self-healing-thesis
+# NOT "environment" — that name collides with Ansible's own reserved
+# `environment` keyword (used for task/play-level env-var injection), which
+# silently shadows this default wherever it's templated as `{{ environment }}`
+# rather than raising an error. Confirmed live: templating rendered as `[]`
+# instead of "experiment", producing a malformed SSM parameter path
+# (/self-healing-thesis/[]/target-ssh-private-key) and would have done the
+# same to the Terraform backend state key in backend.hcl.j2.
+deploy_environment: experiment
+
+# ── OpenTelemetry / Jaeger ──────────────────────────────────────────────────────
+# Standard OTLP gRPC ingest port; matches the container port bound in
+# roles/monitoring_stack/templates/docker-compose.yml.j2.
+jaeger_otlp_grpc_port: 4317
+
+# ── terraform/targets required variables (variables.tf, no in-repo default) ───
+# Confirmed live 2026-10-01: neither of these was ever templated anywhere in
+# this role -- terraform/targets/terraform.tfvars had always been a manually
+# created file on the monitoring host, never version-controlled, and was
+# silently lost in the 2026-09-28 instance-replacement incident. The
+# orchestrator's own instance_failure remediation (execute.py, which passes
+# only -var=project and -var=environment) would have hit the exact same
+# "Enter a value: bootstrap_state_bucket" non-interactive failure the next
+# time a fresh host hit this path -- it was only reached this time because a
+# campaign happened to be running. Both values below are fixed, stable
+# project constants, not per-deploy-discovered outputs, so a static default
+# here is correct and does not need to be computed at deploy time.
+bootstrap_state_bucket: "self-healing-tfstate-<ACCOUNT_ID>"
+# Pinned AMI (CLAUDE.md Section 3 / terraform/bootstrap's own data "aws_ami"
+# block) -- kept in sync by hand with that pin, same as every other toolchain
+# version in this project.
+ubuntu_ami_id: "ami-0532913178263be11"

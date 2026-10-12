@@ -1,0 +1,234 @@
+# =============================================================================
+# experiments/inject/scenarios.yml — Fault injection scenario library
+#
+# Canonical fault class names MUST match:
+#   - observability/prometheus/rules/fault_classes.yml (alert rule labels)
+#   - orchestrator/routing.yaml (routing table keys)
+#   - orchestrator/classifier.py (_FAULT_CLASSES)
+#   - Thesis Table 3.3 (alert rules), Table 3.4 (routing), Table 4.4 (recovery)
+#
+# Each scenario defines the SSM RunCommand document + parameters to inject
+# the fault onto a target instance via AWS SSM (no SSH required).
+#
+# inject_once.py reads this file and submits an SSM SendCommand for the
+# selected fault_type / target combination.
+#
+# Each command: block also logs a structured "FAULT_INJECT scenario=...
+# run_id=... injection_time=..." marker via `logger` -- this is the exact
+# format ansible/roles/monitoring_stack/templates/logstash.conf.j2's
+# journald branch greps for to apply the fault_injection tag. $RUN_ID is
+# exported by inject_once.py's _inject_ssm() before this script runs, so
+# it's always a real UUID matching the grok pattern's %{UUID:run_id}.
+# Added 2026-09-29: confirmed live that no such marker had ever existed
+# anywhere in this codebase, so the corresponding Logstash tag could never
+# have populated regardless of the (separately fixed) log_type/field-path
+# bugs in that same filter. cleanup: blocks are reference-only -- nothing
+# in this codebase executes them programmatically (run_manual_trial.py
+# has its own separate, hardcoded fix-command list) -- so their
+# FAULT_CLEANUP marker/$RUN_ID only populates if a human operator exports
+# RUN_ID themselves before manually running one.
+# =============================================================================
+
+defaults:
+  region:          ap-southeast-1
+  output_s3_key_prefix: "experiment-output"
+  timeout_seconds: 120
+
+scenarios:
+
+  # ── 1. CPU Overload ──────────────────────────────────────────────────────────
+  # Runs stress-ng with one worker per vCPU for `duration_seconds`.
+  # Detection: idle CPU < 15% (node_cpu_seconds_total) for 30 s
+  cpu_overload:
+    fault_type:        cpu_overload
+    description:       "Spawn stress-ng CPU workers to saturate all vCPUs"
+    detection_signal:  "node_cpu_seconds_total{mode='idle'} < 0.15 for 30s"
+    default_duration:  120    # seconds
+    ssm_document:      AWS-RunShellScript
+    command: |
+      #!/bin/bash
+      set -euo pipefail
+      DURATION="${DURATION:-120}"
+      WORKERS=$(nproc)
+      logger -t self-healing "INJECT fault=cpu_overload workers=$WORKERS duration=${DURATION}s"
+      logger -t self-healing "FAULT_INJECT scenario=cpu_overload run_id=${RUN_ID:-unknown} injection_time=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+      stress-ng --cpu "$WORKERS" --timeout "${DURATION}s" --metrics-brief &
+      echo "stress-ng PID: $!"
+    cleanup: |
+      pkill -x stress-ng || true
+      logger -t self-healing "CLEANUP fault=cpu_overload"
+      logger -t self-healing "FAULT_CLEANUP scenario=cpu_overload run_id=${RUN_ID:-unknown}"
+
+  # ── 2. Memory Exhaustion ─────────────────────────────────────────────────────
+  # Allocates memory down to ~6% available (anonymous pages via stress-ng
+  # --vm --vm-keep), sized from CURRENTLY available RAM.
+  # Detection: MemAvailable/MemTotal < 0.10 for 30 s
+  memory_exhaustion:
+    fault_type:        memory_exhaustion
+    description:       "Exhaust available memory to < 10% of total"
+    detection_signal:  "node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes < 0.10 for 30s"
+    default_duration:  120
+    ssm_document:      AWS-RunShellScript
+    command: |
+      #!/bin/bash
+      set -euo pipefail
+      DURATION="${DURATION:-120}"
+      TOTAL_KB=$(awk '/^MemTotal:/{print $2}' /proc/meminfo)
+      AVAIL_KB=$(awk '/^MemAvailable:/{print $2}' /proc/meminfo)
+      # 6% target + a 24 MB safety buffer, sized from CURRENTLY available
+      # memory rather than total RAM - confirmed live via multiple
+      # calibration passes on this 908MB no-swap instance class: sizing off
+      # TOTAL RAM (the original bug) requested more than was actually free
+      # and caused OOM-kill oscillation so the alert never fired at all;
+      # margins tighter than this destabilised the host (spurious
+      # instance_failure alerts from node_exporter/SSM briefly going
+      # unresponsive); margins looser than this left MemAvailable
+      # comfortably but permanently above the 10% alert threshold. This
+      # value reliably crossed the threshold and produced a full successful
+      # closed-loop detection (T_detect=62.3s) in live verification. Note:
+      # the exact resulting percentage still varies a few points by host
+      # page-cache state at injection time (observed 9-15% across
+      # instances) - if a specific target never crosses 10% in practice,
+      # tighten the 24576 (KB) buffer for that run.
+      TARGET_AVAIL_KB=$(( TOTAL_KB * 6 / 100 ))
+      ALLOC_KB=$(( AVAIL_KB - TARGET_AVAIL_KB - 24576 ))
+      if [ "$ALLOC_KB" -le 0 ]; then
+        echo "Already at or below target availability - no allocation needed."
+        exit 0
+      fi
+      ALLOC_MB=$(( ALLOC_KB / 1024 ))
+      logger -t self-healing "INJECT fault=memory_exhaustion alloc=${ALLOC_MB}MB duration=${DURATION}s"
+      logger -t self-healing "FAULT_INJECT scenario=memory_exhaustion run_id=${RUN_ID:-unknown} injection_time=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+      # --vm-keep holds the allocated buffer resident instead of stress-ng's
+      # default alloc/touch/free/reallocate loop, which caused oscillation
+      # under the original (total-RAM-based) sizing bug.
+      stress-ng --vm 1 --vm-bytes "${ALLOC_MB}M" --vm-keep --timeout "${DURATION}s" &
+      echo "stress-ng PID: $!"
+    cleanup: |
+      pkill -x stress-ng || true
+      logger -t self-healing "CLEANUP fault=memory_exhaustion"
+      logger -t self-healing "FAULT_CLEANUP scenario=memory_exhaustion run_id=${RUN_ID:-unknown}"
+
+  # ── 3. Disk Saturation ───────────────────────────────────────────────────────
+  # Fills the root filesystem to > 90% usage with a sparse file.
+  # Detection: (1 - node_filesystem_free_bytes/node_filesystem_size_bytes) > 0.90 for 60 s
+  disk_saturation:
+    fault_type:        disk_saturation
+    description:       "Fill root filesystem to > 90% to trigger disk saturation alert"
+    detection_signal:  "node_filesystem_avail_bytes / node_filesystem_size_bytes < 0.10 for 60s"
+    default_duration:  120
+    ssm_document:      AWS-RunShellScript
+    command: |
+      #!/bin/bash
+      set -euo pipefail
+      FILL_FILE=/var/tmp/self-healing-disk-fill
+      DURATION="${DURATION:-120}"
+      # Calculate how much to write: target 92% full of the ROOT filesystem.
+      # FILL_FILE must live on a path backed by `/` (e.g. /var/tmp), not
+      # /tmp - confirmed live: /tmp is a separate tmpfs mount (RAM-backed,
+      # capped independently of the root ext4 filesystem `df /` measures
+      # below) and was already at 100% capacity, so every write there
+      # failed instantly with ENOSPC ("dd: IO error: No space left on
+      # device") regardless of script content - this, not any awk/pipe
+      # syntax issue, was the true root cause of every prior failure.
+      DF_LINE=$(df --output=size,used,avail /)
+      DF_LINE=$(echo "$DF_LINE" | tail -n1)
+      set -- $DF_LINE
+      TOTAL_KB=$1
+      USED_KB=$2
+      FREE_KB=$3
+      TARGET_USED_KB=$(( TOTAL_KB * 92 / 100 ))
+      FILL_KB=$(( TARGET_USED_KB - USED_KB ))
+      if [ "$FILL_KB" -le 0 ]; then
+        echo "Already above 92% - no fill needed."
+        exit 0
+      fi
+      # bs=1M (not 1K) - confirmed live: bs=1K for a multi-GB fill takes
+      # long enough (millions of tiny write() syscalls) to risk exceeding
+      # the injection's execution budget; 1M blocks are ~1024x fewer syscalls.
+      FILL_MB=$(( FILL_KB / 1024 ))
+      logger -t self-healing "INJECT fault=disk_saturation fill=${FILL_MB}MB duration=${DURATION}s"
+      logger -t self-healing "FAULT_INJECT scenario=disk_saturation run_id=${RUN_ID:-unknown} injection_time=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+      dd if=/dev/zero of="$FILL_FILE" bs=1M count="$FILL_MB" 2>/dev/null
+      echo "Fill file created: $FILL_FILE (${FILL_MB} MB)"
+      sleep "$DURATION"
+      rm -f "$FILL_FILE"
+      logger -t self-healing "CLEANUP fault=disk_saturation fill_file_removed"
+      logger -t self-healing "FAULT_CLEANUP scenario=disk_saturation run_id=${RUN_ID:-unknown}"
+    cleanup: |
+      rm -f /var/tmp/self-healing-disk-fill
+      logger -t self-healing "CLEANUP fault=disk_saturation"
+      logger -t self-healing "FAULT_CLEANUP scenario=disk_saturation run_id=${RUN_ID:-unknown}"
+
+  # ── 4. Service Crash ─────────────────────────────────────────────────────────
+  # Kills the NGINX master process group.
+  # Detection: node_systemd_unit_state{name="nginx.service", state="active"} == 0
+  #            for 30 s (systemd unit state, not scrape-target reachability)
+  service_crash:
+    fault_type:        service_crash
+    description:       "Kill the NGINX master process to simulate service crash"
+    detection_signal:  "node_systemd_unit_state{name='nginx.service', state='active'} == 0"
+    default_duration:  0     # crash is instantaneous; duration unused
+    ssm_document:      AWS-RunShellScript
+    command: |
+      #!/bin/bash
+      set -euo pipefail
+      logger -t self-healing "INJECT fault=service_crash"
+      logger -t self-healing "FAULT_INJECT scenario=service_crash run_id=${RUN_ID:-unknown} injection_time=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+      # Stop nginx without systemd restart so it stays down
+      systemctl stop nginx
+      # Also kill any orphaned worker processes
+      pkill -x nginx || true
+      echo "NGINX stopped."
+    cleanup: |
+      systemctl start nginx || true
+      logger -t self-healing "CLEANUP fault=service_crash"
+      logger -t self-healing "FAULT_CLEANUP scenario=service_crash run_id=${RUN_ID:-unknown}"
+
+  # ── 5. Configuration Drift ───────────────────────────────────────────────────
+  # Overwrites the NGINX config with an invalid server_name to simulate drift.
+  # Detection: nginx.service active state != "active" after config reload (custom hash check)
+  configuration_drift:
+    fault_type:        configuration_drift
+    description:       "Inject nginx.conf drift — corrupt server_name to trigger reload failure"
+    detection_signal:  "nginx_config_hash != canonical_hash"
+    default_duration:  0
+    ssm_document:      AWS-RunShellScript
+    command: |
+      #!/bin/bash
+      set -euo pipefail
+      DRIFT_MARKER="# DRIFT_INJECTED_BY_SELF_HEALING_HARNESS"
+      CONFIG=/etc/nginx/conf.d/healthz.conf
+      if grep -q "$DRIFT_MARKER" "$CONFIG" 2>/dev/null; then
+        echo "Drift already present - skipping re-injection."
+        exit 0
+      fi
+      logger -t self-healing "INJECT fault=configuration_drift"
+      logger -t self-healing "FAULT_INJECT scenario=configuration_drift run_id=${RUN_ID:-unknown} injection_time=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+      cp "$CONFIG" "${CONFIG}.bak"
+      # Append invalid directive to cause nginx -t to fail (detectable drift)
+      echo "$DRIFT_MARKER" >> "$CONFIG"
+      echo "invalid_directive_self_healing_test;" >> "$CONFIG"
+      # Attempt reload - will fail, leaving service in degraded state
+      nginx -t 2>&1 || true
+      systemctl reload nginx 2>&1 || true
+      echo "Configuration drift injected."
+    cleanup: |
+      CONFIG=/etc/nginx/conf.d/healthz.conf
+      [ -f "${CONFIG}.bak" ] && mv "${CONFIG}.bak" "$CONFIG"
+      systemctl reload nginx || systemctl restart nginx
+      logger -t self-healing "CLEANUP fault=configuration_drift"
+      logger -t self-healing "FAULT_CLEANUP scenario=configuration_drift run_id=${RUN_ID:-unknown}"
+
+  # ── 6. Instance Failure ──────────────────────────────────────────────────────
+  # Terminates the EC2 instance directly via the AWS API.
+  # Terraform remediation (targets workspace) recreates it.
+  # Detection: up{job="node"} == 0 for 60 s (node_exporter disappears)
+  instance_failure:
+    fault_type:        instance_failure
+    description:       "Terminate EC2 instance via AWS API to simulate instance failure"
+    detection_signal:  "up{job='node_exporter'} == 0 for 60s"
+    default_duration:  0     # termination is API-driven; no duration
+    ssm_document:      null  # uses EC2 TerminateInstances API directly (not SSM)
+    command:           null  # inject_once.py handles EC2 termination separately
+    cleanup:           null  # Terraform apply recreates the instance

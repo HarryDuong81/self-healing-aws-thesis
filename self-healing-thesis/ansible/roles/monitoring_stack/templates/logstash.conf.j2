@@ -1,0 +1,109 @@
+input {
+  beats {
+    port => {{ logstash_beats_port }}
+  }
+}
+
+filter {
+  # ── NGINX JSON access log ─────────────────────────────────────────────────────
+  # roles/filebeat's own filebeat.yml sets fields.log_type to "nginx" and
+  # "journald" (not "nginx_access"/"syslog" as this filter checked before) --
+  # confirmed live 2026-09-29: every document was falling through both
+  # branches unenriched, so no fault_injection/fault_cleanup/orchestrator_event
+  # tag had ever been applied to anything in Elasticsearch.
+  #
+  # Second bug in the same fix, also confirmed live via a synthetic test
+  # document: roles/filebeat's filebeat.yml sets `fields_under_root: true`
+  # on both inputs, which places log_type at the event's ROOT -- [log_type]
+  # -- not nested under [fields][log_type] as this filter checked. That
+  # path never existed on any real document, so even the value-name fix
+  # above was still unconditionally false. Match [log_type] directly.
+  #
+  # Third bug, same investigation: roles/filebeat now emits log_type
+  # "nginx_access" specifically (split out from a combined "nginx" input
+  # that also carried nginx's plain-text error.log -- see that role's own
+  # comment). Match the new, narrower value so this JSON parse only ever
+  # runs against genuinely JSON-formatted lines.
+  if [log_type] == "nginx_access" {
+    json {
+      source => "message"
+      target => "nginx"
+    }
+    date {
+      match => ["[nginx][time]", "ISO8601"]
+    }
+    # Drop noisy health check 200s. Currently unreachable in practice --
+    # /healthz has access_log off in user_data_target.sh.tpl, so it's
+    # never logged at all -- but corrected from the previous "/health"
+    # (never the actual served path, see CLAUDE.md Section 7.6) in case
+    # access_log is ever re-enabled there.
+    if [nginx][uri] == "/healthz" and [nginx][status] == 200 {
+      drop {}
+    }
+    mutate { add_tag => ["nginx_access"] }
+  }
+
+  # ── Syslog / journald ─────────────────────────────────────────────────────────
+  else if [log_type] == "journald" {
+    # Confirmed live 2026-09-29: Filebeat's journald input already parses the
+    # journal entry itself -- structured metadata lands in [journald][*] /
+    # [systemd][*] / [process][*], and [@timestamp] is already the real
+    # event time. [message] is left as the bare log body with NO syslog
+    # envelope ("TIMESTAMP HOST PROGRAM: MESSAGE") at all -- e.g. a real
+    # sample is just "Finished config-drift-check.service - Publish
+    # canonical_hash/running_hash gauges...". The grok pattern this filter
+    # used to run expected that envelope and could never match, so
+    # [syslog_message] was always undefined and every check that depended
+    # on it silently never fired. Match [message] and Filebeat's own
+    # structured fields directly instead of re-deriving them via grok.
+
+    # Detect FAULT_INJECT markers from experiment scripts. Not currently
+    # emitted by anything in this codebase (experiments/inject/ has no
+    # logger call producing this string) -- this tag will not populate
+    # until fault injection is instrumented to log one. Kept as the
+    # intended hook for that future work, not a claim that it works today.
+    if [message] =~ /FAULT_INJECT/ {
+      grok {
+        match => {
+          "message" => "FAULT_INJECT scenario=%{DATA:fault_scenario} run_id=%{UUID:run_id}(?: mode=%{DATA:fault_mode})? injection_time=%{DATA:injection_time}"
+        }
+      }
+      mutate { add_tag => ["fault_injection"] }
+    }
+
+    # Detect FAULT_CLEANUP markers (same not-currently-emitted caveat above)
+    if [message] =~ /FAULT_CLEANUP/ {
+      grok {
+        match => {
+          "message" => "FAULT_CLEANUP scenario=%{DATA:fault_scenario} run_id=%{UUID:run_id}"
+        }
+      }
+      mutate { add_tag => ["fault_cleanup"] }
+    }
+
+    # Detect orchestrator remediation events. The orchestrator's systemd
+    # unit is named orchestrator.service (roles/self_healing/templates/
+    # orchestrator.service.j2) -- Filebeat's journald input already puts
+    # this in [journald][unit], not behind a syslog "program:" prefix.
+    if [journald][unit] == "orchestrator.service" {
+      mutate { add_tag => ["orchestrator_event"] }
+    }
+
+    # Detect genuine service failures (service_crash fault class) directly
+    # against the bare message body.
+    if [message] =~ /Failed to start|Stopped unexpectedly|Main process exited|failed with result/ {
+      mutate {
+        add_field => { "fault_type" => "service_crash" }
+        add_tag   => ["fault_detected"]
+      }
+    }
+  }
+}
+
+output {
+  elasticsearch {
+    hosts => ["elasticsearch:{{ elasticsearch_port }}"]
+    index => "self-healing-%{+YYYY.MM.dd}"
+    manage_template => false
+  }
+}

@@ -1,0 +1,275 @@
+name: Deploy Monitoring and Self-Healing Stack
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: Type DEPLOY to release this commit to AWS
+        required: true
+        type: string
+        default: ""
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: ap-southeast-1
+  AWS_DEFAULT_REGION: ap-southeast-1
+  TF_IN_AUTOMATION: "true"
+  TF_INPUT: "false"
+
+concurrency:
+  group: terraform-production
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Deploy to Monitoring Stack Server
+    runs-on: ubuntu-24.04
+    environment: production
+    # The git root is ITS2024_Master_Thesis; the artefact lives one level down.
+    # This also makes the `tar ... .` below produce a bundle whose top level is
+    # ansible/, terraform/, orchestrator/ — the shape the monitoring host
+    # expects after extraction.
+    defaults:
+      run:
+        shell: bash
+        working-directory: self-healing-thesis
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Verify deployment confirmation
+        run: |
+          [[ "${{ inputs.confirm }}" == "DEPLOY" ]] || {
+            echo "Deployment not confirmed. Enter DEPLOY exactly."
+            exit 1
+          }
+
+      - name: Configure AWS credentials with GitHub OIDC
+        uses: aws-actions/configure-aws-credentials@v6.2.3
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ap-southeast-1
+          role-session-name: github-${{ github.run_id }}-deploy
+
+      - name: Verify AWS identity
+        run: aws sts get-caller-identity
+
+      - name: Set up Terraform 1.14.9
+        uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: "1.14.9"
+          terraform_wrapper: false
+
+      - name: Initialize bootstrap remote state
+        run: |
+          terraform -chdir=terraform/bootstrap init \
+            -reconfigure -input=false \
+            -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
+            -backend-config="dynamodb_table=${{ secrets.TF_LOCK_TABLE }}" \
+            -backend-config="region=ap-southeast-1"
+
+      - name: Read deployment metadata
+        id: metadata
+        run: |
+          cd terraform/bootstrap
+          {
+            echo "monitoring_instance_id=$(terraform output -raw monitoring_instance_id)"
+            echo "data_bucket=$(terraform output -raw data_bucket_name)"
+            echo "lock_table=$(terraform output -raw dynamodb_table_name)"
+            echo "sns_arn=$(terraform output -raw sns_topic_arn)"
+            echo "ssh_parameter=$(terraform output -raw target_ssh_parameter_name)"
+          } >> "$GITHUB_OUTPUT"
+
+      # local_file.backend_tfvars in terraform/bootstrap/main.tf writes this
+      # file to disk as a side effect of terraform apply, so it only exists
+      # on whichever machine actually ran apply for the bootstrap workspace.
+      # It is gitignored (a generated artifact, not source), so a fresh
+      # checkout on this runner never has it, and roles/self_healing's own
+      # sync task for it then fails with "Could not find or access ... on
+      # the Ansible Controller" once the bundle reaches the monitoring host.
+      # Regenerate it here, in the same format and from the same two
+      # outputs the local_file resource itself uses, so the bundle built
+      # below always carries a correct copy regardless of where bootstrap
+      # was last applied.
+      - name: Render bootstrap backend config
+        run: |
+          cd terraform/bootstrap
+          cat > outputs.backend.tfvars <<EOT
+          bucket         = "$(terraform output -raw backend_bucket)"
+          region         = "$AWS_REGION"
+          dynamodb_table = "$(terraform output -raw backend_dynamodb_table)"
+          encrypt        = true
+          EOT
+
+      - name: Campaign guard
+        run: |
+          set -euo pipefail
+          monitoring_id="${{ steps.metadata.outputs.monitoring_instance_id }}"
+
+          command_id="$(aws ssm send-command \
+            --instance-ids "$monitoring_id" \
+            --document-name AWS-RunShellScript \
+            --comment "campaign guard ${GITHUB_RUN_ID}" \
+            --parameters 'commands=["pgrep -f '\''run_campaign.py|run_one.py|run_manual_trial.py|run_s3_trial.py'\'' >/dev/null && exit 42 || exit 0"]' \
+            --query 'Command.CommandId' --output text)"
+
+          deadline=$((SECONDS + 60))
+          while (( SECONDS < deadline )); do
+            status="$(aws ssm get-command-invocation \
+              --command-id "$command_id" \
+              --instance-id "$monitoring_id" \
+              --query Status --output text 2>/dev/null || true)"
+            case "$status" in
+              Success)
+                echo "Campaign guard passed: no trial harness running."
+                exit 0
+                ;;
+              Failed|Cancelled|TimedOut|Cancelling)
+                echo "Campaign process is active, or the guard could not run: $status"
+                exit 1
+                ;;
+              *) sleep 3 ;;
+            esac
+          done
+          echo "Campaign guard timed out."
+          exit 1
+
+      # The private key is never bundled: it is fetched on the monitoring host
+      # from SSM Parameter Store using that host's own instance role. The *.pem
+      # exclusion is defence in depth for local runs of this workflow.
+      - name: Build deployment bundle
+        run: |
+          tar \
+            --exclude='*/.terraform' \
+            --exclude='*/.terraform/*' \
+            --exclude='*.tfstate' \
+            --exclude='*.tfstate.*' \
+            --exclude='*.tfplan' \
+            --exclude='*.pem' \
+            --exclude='./terraform/bootstrap/terraform.tfvars' \
+            --exclude='results/*' \
+            --exclude='**/__pycache__' \
+            --exclude='**/.pytest_cache' \
+            --exclude='**/.ruff_cache' \
+            -czf "$RUNNER_TEMP/self-healing-bundle.tar.gz" .
+          tar -tzf "$RUNNER_TEMP/self-healing-bundle.tar.gz" >/dev/null
+          if tar -tzf "$RUNNER_TEMP/self-healing-bundle.tar.gz" | grep -q '\.pem$'; then
+            echo "Refusing to upload: bundle contains a .pem file."
+            exit 1
+          fi
+
+      - name: Upload deployment bundle to data bucket
+        run: |
+          aws s3 cp "$RUNNER_TEMP/self-healing-bundle.tar.gz" \
+            "s3://${{ steps.metadata.outputs.data_bucket }}/_deploy/${GITHUB_SHA}.tar.gz" \
+            --sse AES256
+
+      # Ansible tooling lives in /opt/deploy-venv, owned by root and dedicated
+      # to this workflow. /opt/orchestrator/venv is left entirely to
+      # roles/self_healing, which creates it as the ubuntu user behind a
+      # `creates:` guard — pre-creating it here as root would make that guard
+      # skip and the role's subsequent pip tasks fail with permission denied.
+      - name: Execute deployment through SSM
+        id: ssm_deploy
+        run: |
+          monitoring_id="${{ steps.metadata.outputs.monitoring_instance_id }}"
+          deploy_dir="/tmp/self-healing-deploy-${GITHUB_SHA}"
+          bundle_uri="s3://${{ steps.metadata.outputs.data_bucket }}/_deploy/${GITHUB_SHA}.tar.gz"
+          data_bucket="${{ steps.metadata.outputs.data_bucket }}"
+
+          jq -n \
+            --arg d "$deploy_dir" \
+            --arg u "$bundle_uri" \
+            --arg b "$data_bucket" \
+            --arg lock "${{ steps.metadata.outputs.lock_table }}" \
+            --arg sns "${{ steps.metadata.outputs.sns_arn }}" \
+            --arg key "${{ steps.metadata.outputs.ssh_parameter }}" \
+            '{commands:[
+              "set -euo pipefail",
+              "export DEBIAN_FRONTEND=noninteractive",
+              "apt-get update -qq",
+              "apt-get install -y -qq python3 python3-pip python3-venv curl unzip jq awscli",
+              ("rm -rf " + $d),
+              ("mkdir -p " + $d),
+              ("aws s3 cp " + $u + " " + $d + "/bundle.tar.gz"),
+              ("tar -xzf " + $d + "/bundle.tar.gz -C " + $d),
+              ("aws ssm get-parameter --name " + $key + " --with-decryption --region ap-southeast-1 --query Parameter.Value --output text > " + $d + "/terraform/bootstrap/target_ssh_key.pem"),
+              ("chmod 600 " + $d + "/terraform/bootstrap/target_ssh_key.pem"),
+              ("grep -q \"BEGIN .*PRIVATE KEY\" " + $d + "/terraform/bootstrap/target_ssh_key.pem || { echo \"SSM parameter did not decrypt to a PEM key — check kms:Decrypt on the instance role\"; exit 1; }"),
+              ("export SSM_BUCKET=" + $b + " DYNAMODB_LOCK_TABLE=" + $lock + " SNS_TOPIC_ARN=" + $sns),
+              ("cd " + $d),
+              # ansible-playbook runs from the bundle root, not ansible/, so
+              # ansible.cfg is never auto-discovered from cwd and its
+              # roles_path setting does not apply. bootstrap.yml happened to
+              # still resolve its roles because ansible-core also checks a
+              # playbook-relative roles directory by default, which is
+              # correct for a playbook living directly in ansible/. The
+              # playbooks/deploy.yml file lives one directory deeper, so that
+              # same default points at a nonexistent path instead. Matches
+              # the same workaround ci.yml already applies for its Ansible
+              # lint job.
+              ("export ANSIBLE_CONFIG=" + $d + "/ansible/ansible.cfg"),
+              "python3 -m venv /opt/deploy-venv",
+              "/opt/deploy-venv/bin/pip install --quiet --disable-pip-version-check ansible-core==2.17.14 boto3 botocore",
+              "/opt/deploy-venv/bin/ansible-galaxy collection install -r ansible/requirements.yml",
+              "/opt/deploy-venv/bin/ansible-playbook ansible/bootstrap.yml -i ansible/inventory/aws_ec2.yml --limit monitoring_host -e ansible_connection=local",
+              "/opt/deploy-venv/bin/ansible-playbook ansible/playbooks/deploy.yml -i ansible/inventory/aws_ec2.yml --limit monitoring_host -e ansible_connection=local",
+              "/opt/deploy-venv/bin/ansible-playbook ansible/playbooks/deploy.yml -i ansible/inventory/aws_ec2.yml --limit target_nodes",
+              "curl --fail --silent --show-error http://127.0.0.1:9094/healthz",
+              "curl --fail --silent --show-error http://127.0.0.1:9090/-/ready",
+              "curl --fail --silent --show-error http://127.0.0.1:9093/-/ready"
+            ]}' > "$RUNNER_TEMP/ssm-commands.json"
+
+          command_id="$(aws ssm send-command \
+            --instance-ids "$monitoring_id" \
+            --document-name AWS-RunShellScript \
+            --comment "GitHub Actions deployment ${GITHUB_SHA}" \
+            --timeout-seconds 1800 \
+            --output-s3-bucket-name "$data_bucket" \
+            --output-s3-key-prefix "_deploy/ssm/${GITHUB_SHA}" \
+            --parameters "file://$RUNNER_TEMP/ssm-commands.json" \
+            --query 'Command.CommandId' --output text)"
+          echo "command_id=$command_id" >> "$GITHUB_OUTPUT"
+          echo "SSM command: $command_id"
+          echo "Full output: s3://$data_bucket/_deploy/ssm/${GITHUB_SHA}/"
+
+      - name: Wait for SSM deployment
+        run: |
+          command_id="${{ steps.ssm_deploy.outputs.command_id }}"
+          instance_id="${{ steps.metadata.outputs.monitoring_instance_id }}"
+          deadline=$((SECONDS + 1800))
+          while (( SECONDS < deadline )); do
+            status="$(aws ssm get-command-invocation \
+              --command-id "$command_id" \
+              --instance-id "$instance_id" \
+              --query Status --output text)"
+            case "$status" in
+              Success)
+                echo "Deployment succeeded."
+                exit 0
+                ;;
+              Failed|Cancelled|TimedOut|Cancelling)
+                echo "Deployment failed: $status"
+                echo "Truncated tail follows; full log is in S3 under _deploy/ssm/${GITHUB_SHA}/"
+                aws ssm get-command-invocation \
+                  --command-id "$command_id" \
+                  --instance-id "$instance_id" \
+                  --query '{stdout:StandardOutputContent,stderr:StandardErrorContent}' \
+                  --output json || true
+                exit 1
+                ;;
+              *) sleep 10 ;;
+            esac
+          done
+          echo "Deployment polling timed out."
+          exit 1
+
+      - name: Remove deployment bundle from S3
+        if: always()
+        run: |
+          aws s3 rm \
+            "s3://${{ steps.metadata.outputs.data_bucket }}/_deploy/${GITHUB_SHA}.tar.gz" || true

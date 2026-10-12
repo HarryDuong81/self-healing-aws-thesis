@@ -1,0 +1,105 @@
+# =============================================================================
+# NOT DEPLOYED — reference copy only.
+#
+# The monitoring stack is deployed from Ansible templates, not from this
+# directory. This file is superseded by:
+#     ansible/roles/monitoring_stack/templates/prometheus.yml.j2
+# Any change made here has no effect on a deployed environment, and the two
+# copies have drifted before. Edit the template; treat this file as
+# documentation of intent at best.
+# =============================================================================
+
+# prometheus.yml — Prometheus scrape configuration
+# =============================================================================
+# Monitoring server scrapes three fixed target EC2 instances (private subnet).
+# EC2 service discovery is not used because target instances have fixed IPs
+# assigned at Terraform apply time — static configs eliminate SD latency.
+#
+# Replace TARGET_1_IP / TARGET_2_IP / TARGET_3_IP with actual private IPs
+# from `terraform output target_private_ips`.
+#
+# In production this file is rendered by the Ansible monitoring_stack role
+# (templates/prometheus.yml.j2) with actual IPs from the Ansible inventory.
+# =============================================================================
+
+global:
+  scrape_interval:     15s
+  evaluation_interval: 15s
+  scrape_timeout:      10s
+
+  external_labels:
+    project:     "self-healing-thesis"
+    environment: "experiment"
+    region:      "ap-southeast-1"
+
+# ── Alert rules ───────────────────────────────────────────────────────────────
+rule_files:
+  - "/etc/prometheus/rules/fault_classes.yml"
+
+# ── Alertmanager ──────────────────────────────────────────────────────────────
+# Alertmanager runs in Docker on the same host; Docker port-binding exposes :9093.
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets:
+            - "localhost:9093"
+
+# ── Scrape jobs ───────────────────────────────────────────────────────────────
+scrape_configs:
+
+  # ── Target EC2 instances — Node Exporter :9100 ───────────────────────────
+  # Three fixed target instances in the private subnet.
+  # node_exporter started with --collector.systemd --collector.processes.
+  # ec2_instance_id label lets the orchestrator route SSM RunCommand without
+  # an extra describe_instances API call.
+  # Replace TARGET_N_IP / TARGET_N_INSTANCE_ID from: terraform output
+  - job_name: "node_exporter"
+    static_configs:
+      - targets: ["TARGET_1_IP:9100"]
+        labels:
+          ec2_instance_id: "TARGET_1_INSTANCE_ID"
+          node_name: "target-1"
+      - targets: ["TARGET_2_IP:9100"]
+        labels:
+          ec2_instance_id: "TARGET_2_INSTANCE_ID"
+          node_name: "target-2"
+      - targets: ["TARGET_3_IP:9100"]
+        labels:
+          ec2_instance_id: "TARGET_3_INSTANCE_ID"
+          node_name: "target-3"
+
+    relabel_configs:
+      # Strip ":9100" so alert instance label shows clean private IP
+      - source_labels: [__address__]
+        regex:         "([^:]+):\\d+"
+        target_label:  instance
+        replacement:   "${1}"
+
+  # ── Flask Orchestrator — pipeline metrics (MTTR gauges, alert counters) ─────
+  # Orchestrator runs as a Docker container on port 9094 (Thesis Table 4.3,
+  # Listing 4.9).  It exposes /metrics via prometheus-flask-exporter,
+  # publishing pipeline-internal counters (alerts received, remediations,
+  # retry counts) used for RQ3 observability-overhead analysis.
+  - job_name: "orchestrator"
+    static_configs:
+      - targets:
+          - "localhost:9094"
+    metrics_path: /metrics
+
+  # ── Prometheus self-monitoring ────────────────────────────────────────────
+  - job_name: "prometheus"
+    static_configs:
+      - targets:
+          - "localhost:9090"
+
+  # ── cAdvisor — Docker container resource metrics (RQ3 overhead) ──────────
+  # cAdvisor runs in Docker on the monitoring server.
+  - job_name: "cadvisor"
+    static_configs:
+      - targets:
+          - "localhost:8080"
+    metric_relabel_configs:
+      # Drop high-cardinality metrics not needed for the thesis
+      - source_labels: [__name__]
+        regex: "container_tasks_state|container_memory_failures_total"
+        action: drop

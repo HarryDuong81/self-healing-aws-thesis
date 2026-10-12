@@ -1,0 +1,186 @@
+global:
+  resolve_timeout: 5m
+
+# =============================================================================
+# Route all six fault-class alerts to the orchestrator webhook.
+#
+# group_by [fault_type, instance] — Thesis §3.5.1:
+#   "Grouping is configured on the (fault_type, instance) label pair, so that
+#   multiple alerts arising from the same underlying fault on the same instance
+#   are coalesced into a single notification."
+#
+# repeat_interval: 5m — Workflow v5 Phase 7:
+#   A repeat fires if the alert has not resolved after one repeat cycle.
+#   5 m is long enough to avoid hammering the orchestrator during remediation
+#   (typical T_remediate < 90 s) but short enough to re-notify if remediation
+#   has genuinely stalled.
+#
+# CRITICAL: The default receiver is "null".  Every fault-class alert must be
+# explicitly routed to the orchestrator, regardless of severity.
+# configuration_drift has severity=warning and would silently drop if only
+# severity=critical were routed here.  We route on the presence of fault_type
+# to cover all six fault classes without depending on severity labels.
+# =============================================================================
+
+route:
+  receiver: "null"
+  group_by: ["fault_type", "instance"]
+  group_wait:       10s
+  group_interval:   1m
+  repeat_interval:  4h      # default for unclassified/infra alerts
+
+  routes:
+    # ── Silence the Watchdog keepalive ──────────────────────────────────────
+    - receiver: "null"
+      matchers:
+        - alertname = "Watchdog"
+
+    # ── All six fault-class alerts → orchestrator ────────────────────────────
+    # Matched by the presence of the fault_type label (closed vocabulary).
+    # This covers both critical and warning severity so that configuration_drift
+    # (severity=warning) reaches the orchestrator alongside the five critical alerts.
+    - receiver: orchestrator
+      matchers:
+        - fault_type =~ "cpu_overload|memory_exhaustion|disk_saturation|service_crash|configuration_drift|instance_failure"
+      # Confirmed live 2026-10-01: a second S1 campaign run (after the
+      # group_interval widening below) lost one instance_failure trial to a
+      # 12-minute alert-delivery delay, NOT a remediation failure -- the
+      # recreation genuinely succeeded, just under a self-generated trial_id
+      # because the webhook arrived too late for run_one.py's own
+      # correlation window. Root cause: the top-level route's group_by
+      # (["fault_type", "instance"]) keys on Prometheus's own "instance"
+      # label, which for a target is its private IP -- stable across every
+      # EC2 recreation, since only the underlying instance ID changes, not
+      # the IP. A 60-trial campaign re-tests instance_failure on the same
+      # three targets roughly every 20-90 minutes, so this alert group
+      # effectively never goes idle long enough to be treated as "new" --
+      # every genuinely distinct occurrence gets quantised to the group's
+      # own group_interval clock (15m, see below) instead of firing
+      # immediately, exactly the same symptom as the redundant-redelivery
+      # bug this route's group_interval widening already fixed, just for
+      # the opposite reason (a real new occurrence, not a stale repeat).
+      # ec2_instance_id (present on up{job="node_exporter"} via this
+      # project's own EC2 service-discovery relabeling, confirmed live:
+      # the two occurrences above carried i-0f894bc2... and i-080c3f70...
+      # respectively) genuinely differs between recreations, so adding it
+      # here gives each real occurrence its own Alertmanager group while
+      # still coalescing redundant redelivery of the *same* ongoing alert
+      # (which shares one ec2_instance_id). Safe for the other five fault
+      # classes too -- their target instance never changes mid-trial, so
+      # the label is simply constant for them, a no-op.
+      group_by:        ["fault_type", "instance", "ec2_instance_id"]
+      group_wait:      10s
+      # Deployment-session fix (2026-09-21, widened again 2026-09-22).
+      # group_interval was 30s originally. Confirmed live, twice, on two
+      # different fault classes (memory_exhaustion, disk_saturation), with
+      # genuinely successful, non-buggy remediations: whenever a single
+      # remediation cycle's T_remediate + T_validate exceeds group_interval,
+      # Alertmanager's routine re-flush of the still-open alert group can
+      # land within milliseconds of the orchestrator's own health-checker
+      # independently confirming the alert cleared. The orchestrator has no
+      # way to distinguish that routine re-notification from a genuinely new
+      # occurrence, so it dispatches a second, fully redundant MAPE-K cycle
+      # against a target that already recovered -- and if this happens twice
+      # within the circuit breaker's window, a third such redelivery trips
+      # circuit_breaker_open, misreporting one successful remediation as
+      # three separate events sharing one trial_id. First widened to 90s,
+      # which cleared every Ansible-actuated class's observed worst case
+      # (disk_saturation: T_remediate=13.2s + T_validate=40.05s = 53.25s)
+      # with real margin.
+      #
+      # 2026-09-22: confirmed live that 90s does not cover instance_failure
+      # -- its T_remediate + T_observability_restore + T_validate routinely
+      # runs 400-660s (RQ3: 479.5s and ~600s observed; official campaign:
+      # up to 658.5s), so the same redundant-redelivery pattern hit it twice
+      # in a row. Both times, two independent safety layers caught it before
+      # any duplicate Terraform apply could happen -- assert_plan_scope()
+      # (AD-018) rejected the resulting empty/no-op plan as inadmissible,
+      # and the circuit breaker suppressed the next redelivery -- so no
+      # infrastructure was ever touched twice. Widened group_interval to
+      # 900s to cover this properly rather than continuing to rely on those
+      # gates as the primary defence; 900s matches the project's own
+      # already-established instance_failure worst-case bound
+      # (run_one.py's MTTR-record poll timeout, Thesis reference §7.4),
+      # rather than inventing a new figure.
+      #
+      # repeat_interval widened to match, not left at 5m: per Alertmanager's
+      # own semantics, repeat_interval -- not group_interval -- is what
+      # re-sends a notification for an alert that is still firing and
+      # unchanged, which is exactly this scenario. The fast-class fix worked
+      # by widening group_interval alone, so something about this
+      # Alertmanager's behaviour clearly involves it too, but repeat_interval
+      # at 300s is also shorter than instance_failure's observed duration
+      # and could independently reproduce the same redundant-delivery
+      # problem regardless of group_interval. Widening only one of the two
+      # would have left an unexplained, untested gap in exactly the
+      # mechanism this change is meant to close.
+      group_interval:  15m
+      repeat_interval: 15m      # was 5m (Thesis Workflow v5 Phase 7 default)
+      # NOTE: `continue` is deliberately NOT set here.  Alertmanager stops at the
+      # first matching child route, so the sns_escalation route below is
+      # currently unreachable.  That is intentional until two things are true:
+      #   1. sns_webhook_url is actually defined (it is not defined anywhere in
+      #      this repository, so the receiver falls back to its Jinja default of
+      #      http://localhost:9094/sns-stub), and
+      #   2. an endpoint exists to receive it -- orchestrator/app.py exposes only
+      #      /alert and /healthz, so that default POSTs into a 404 on the
+      #      orchestrator's own webhook port, which Alertmanager then retries.
+      # Enabling `continue` before both hold turns a dead route into repeated
+      # failing POSTs at the orchestrator during measured trials.  Human
+      # escalation is emitted by the orchestrator itself (Thesis 3.5.3).
+
+    # ── Critical alerts also mirrored to SNS (human awareness) ───────────────
+    # This route is additive — critical fault alerts match BOTH the route above
+    # (→ orchestrator) and this route (→ SNS).  Alertmanager delivers to all
+    # matching routes when continue: true is set on earlier routes.
+    # Matchers are ANDed.  Of the five classes listed, only service_crash and
+    # instance_failure carry severity=critical (cpu/memory/disk are "high",
+    # configuration_drift is "medium"), so the effective scope of this mirror is
+    # those two classes.  The wider regex is retained deliberately: it keeps the
+    # route correct if a severity label is raised later.
+    - receiver: sns_escalation
+      matchers:
+        - severity = "critical"
+        - fault_type =~ "cpu_overload|memory_exhaustion|disk_saturation|service_crash|instance_failure"
+
+receivers:
+  - name: "null"
+
+  - name: orchestrator
+    webhook_configs:
+      # The orchestrator runs as a systemd service directly on the host
+      # (roles/self_healing), not as a container on this Docker network — the
+      # "orchestrator" container hostname this used to reference doesn't
+      # exist (that service definition was removed from docker-compose.yml.j2
+      # as a redundant, port-conflicting second orchestrator deployment).
+      # Reach it via the host's private IP instead (port 9094 — Thesis
+      # Table 4.3, Listing 4.9).
+      - url: "http://{{ hostvars[groups['monitoring_host'][0]]['ec2_private_ip'] }}:{{ orchestrator_port }}/alert"
+        send_resolved: true
+        max_alerts: 5
+        http_config:
+          follow_redirects: true
+
+  - name: sns_escalation
+    # SNS webhook mirrors critical alerts for human awareness (Thesis §3.5.1).
+    # Implemented as a webhook → SNS HTTP endpoint; replace URL with actual
+    # SNS HTTP subscription endpoint from `terraform output sns_topic_arn`.
+    webhook_configs:
+      - url: "{{ sns_webhook_url | default('http://localhost:9094/sns-stub') }}"
+        send_resolved: false
+
+inhibit_rules:
+  # If an instance is down (instance_failure), suppress other fault-class alerts
+  # from that same instance to avoid triggering multiple simultaneous remediations.
+  - source_matchers:
+      - fault_type = "instance_failure"
+    target_matchers:
+      - fault_type =~ "cpu_overload|memory_exhaustion|disk_saturation|service_crash|configuration_drift"
+    equal: ["instance"]
+
+  # Critical suppresses warning for the same instance
+  - source_matchers:
+      - severity = "critical"
+    target_matchers:
+      - severity = "warning"
+    equal: ["instance"]

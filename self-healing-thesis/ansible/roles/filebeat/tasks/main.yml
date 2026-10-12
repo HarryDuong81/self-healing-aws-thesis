@@ -1,0 +1,127 @@
+---
+# roles/filebeat/tasks/main.yml
+# Extracted from ansible/bootstrap.yml's target_nodes play (originally
+# inline) so both the cold-deploy bootstrap play and the new
+# ansible/playbooks/diagnostic_agents.yml playbook (post instance_failure
+# recreation) share one task definition instead of two copies.
+#
+# Requires the caller to define `monitoring_host_ip` (Logstash beats
+# input target). `filebeat_version` comes from this role's own defaults.
+#
+# apt-key was removed entirely on this Ubuntu release (confirmed live:
+# "/bin/sh: 1: apt-key: not found" — deprecated since 21.10, dropped in
+# later releases). Use the modern signed-by keyring approach instead:
+# dearmor the key into /etc/apt/keyrings/ and reference it explicitly in
+# the source list, rather than trusting it repo-wide via the legacy
+# apt-key keyring.
+
+- name: "Filebeat | Create APT keyrings directory"
+  file:
+    path: /etc/apt/keyrings
+    state: directory
+    mode: "0755"
+
+- name: "Filebeat | Add Elastic APT key"
+  shell: |
+    set -euo pipefail
+    wget -qO - https://artifacts.elastic.co/GPG-KEY-elasticsearch | \
+      gpg --dearmor -o /etc/apt/keyrings/elastic.gpg
+  args:
+    creates: /etc/apt/keyrings/elastic.gpg
+
+- name: "Filebeat | Add Elastic APT repository"
+  copy:
+    dest: /etc/apt/sources.list.d/elastic-9.x.list
+    content: "deb [signed-by=/etc/apt/keyrings/elastic.gpg] https://artifacts.elastic.co/packages/9.x/apt stable main\n"
+
+- name: "Filebeat | Install filebeat={{ filebeat_version }}"
+  shell: |
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update -qq
+    apt-get install -y -qq filebeat={{ filebeat_version }}
+
+- name: "Filebeat | Write configuration"
+  # `type: log` was removed entirely in Filebeat 9.4.1 - confirmed live:
+  # "Log input is deprecated. Use Filestream input instead" is a HARD
+  # failure (not a warning) that crashes the crawler on startup, which
+  # systemd then rapid-restarts until it hits "Start request repeated too
+  # quickly" and settles into `failed` — the service never actually runs
+  # for more than a few hundred milliseconds per attempt. This explains why
+  # Elasticsearch had zero indices at all: Filebeat likely never
+  # successfully shipped a single document on any target in this project's
+  # history. `filestream` (Elastic's documented migration target) requires
+  # a unique `id` per input, unlike the old `log` type.
+  copy:
+    dest: /etc/filebeat/filebeat.yml
+    content: |
+      filebeat.inputs:
+        # nginx's own access_log directive (terraform/modules/compute/
+        # user_data_target.sh.tpl) writes JSON-formatted access logs to
+        # /var/log/nginx-json/access.log, not the default
+        # /var/log/nginx/access.log -- that server-level override replaces
+        # the default path entirely, and nothing symlinks the two back
+        # together. Confirmed live 2026-09-29: /var/log/nginx/access.log
+        # is never written to at all, so this input was permanently empty.
+        # Split from error.log into its own input/log_type so Logstash's
+        # `json { source => "message" }` parse (self-healing-logs
+        # dashboard's nginx_access branch) only ever runs against real
+        # JSON lines -- error.log is plain text and would otherwise fail
+        # that parse on every single line.
+        - type: filestream
+          id: nginx-access-logs
+          enabled: true
+          paths:
+            - /var/log/nginx-json/access.log
+          fields:
+            log_type: nginx_access
+            node_name: "{{ inventory_hostname }}"
+          fields_under_root: true
+
+        - type: filestream
+          id: nginx-error-logs
+          enabled: true
+          paths:
+            - /var/log/nginx/error.log
+          fields:
+            log_type: nginx_error
+            node_name: "{{ inventory_hostname }}"
+          fields_under_root: true
+
+        - type: journald
+          enabled: true
+          id: journald-syslog
+          fields:
+            log_type: journald
+            node_name: "{{ inventory_hostname }}"
+          fields_under_root: true
+
+      output.logstash:
+        hosts: ["{{ monitoring_host_ip }}:5044"]
+
+      logging.level: warning
+      logging.to_files: true
+      logging.files:
+        path: /var/log/filebeat
+        name: filebeat
+        keepfiles: 7
+
+- name: "Filebeat | Enable and start"
+  systemd:
+    name: filebeat
+    enabled: yes
+    state: restarted
+
+# Give the crawler a moment to actually initialise before checking -
+# confirmed live: the OLD (broken) config's crash-loop could still report
+# `systemctl is-active` == "active" for a brief instant right after each
+# systemd restart attempt, before crashing again — a plain immediate check
+# was not a reliable signal on its own.
+- name: "Filebeat | Pause briefly before verifying (avoid catching a transient restart window)"
+  pause:
+    seconds: 3
+
+- name: "Filebeat | Verify service is active"
+  command: systemctl is-active filebeat
+  register: filebeat_active
+  changed_when: false
+  failed_when: filebeat_active.stdout != "active"

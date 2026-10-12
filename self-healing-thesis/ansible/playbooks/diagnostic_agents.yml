@@ -1,0 +1,41 @@
+---
+# =============================================================================
+# ansible/playbooks/diagnostic_agents.yml
+# Restore diagnostic-path telemetry agents (Filebeat, OTel Agent) on a
+# single target — used by orchestrator/execute.py::restore_diagnostic_agents()
+# after an instance_failure Terraform recreation, so a freshly-replaced
+# instance doesn't permanently lose its diagnostic dataset contribution
+# (K11 trace-snippet export) for the rest of a campaign.
+#
+# Deliberately thin — invokes the same roles/filebeat and roles/otel_collector
+# roles ansible/bootstrap.yml's target_nodes play uses, rather than
+# re-running the full System/NGINX/Node-Exporter bootstrap unnecessarily
+# (those are already restored automatically by user_data at first boot).
+#
+# Usage (orchestrator calls this automatically via execute.py):
+#   ansible-playbook ansible/playbooks/diagnostic_agents.yml \
+#       --limit target-1 \
+#       --inventory ansible/inventory/aws_ec2.yml \
+#       --extra-vars "run_id=<uuid> trial_id=<id> target_host=target-1"
+# =============================================================================
+
+- name: "Diagnostic Agents — Restore Filebeat + OTel Agent on a recreated target"
+  hosts: "{{ target_host | default('all') }}"
+  become: yes
+  gather_facts: no   # minimise restore time; no host facts needed
+
+  vars:
+    # groups['monitoring_host'][0] is the INVENTORY HOSTNAME string (the EC2
+    # Name tag, e.g. "self-healing-thesis-experiment-monitoring") - not an
+    # IP. Targets have no DNS able to resolve that name - confirmed live via
+    # `filebeat test output`: "ERROR lookup self-healing-thesis-experiment-
+    # monitoring on 127.0.0.53:53: server misbehaving", even though a raw
+    # TCP connection to the real IP on :5044 succeeded fine. The correct
+    # pattern (already used correctly in orchestrator.env.j2's
+    # MONITORING_SERVER_IP) is hostvars[...]['ec2_private_ip'].
+    monitoring_host_ip: "{{ hostvars[groups['monitoring_host'][0]]['ec2_private_ip'] | default('127.0.0.1') }}"
+
+  roles:
+    - apt_lock_guard
+    - filebeat
+    - otel_collector

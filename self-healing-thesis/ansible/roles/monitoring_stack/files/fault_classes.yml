@@ -1,0 +1,224 @@
+# =============================================================================
+# ansible/roles/monitoring_stack/files/fault_classes.yml
+#
+# THE ACTUAL DEPLOY SOURCE (deployment-session correction, 2026-09-22,
+# CLAUDE.md §15.8's alert_rules.yml/kibana.yml path bug). This file is
+# deployed verbatim to prometheus/rules/alert_rules.yml by
+# ansible/roles/monitoring_stack/tasks/main.yml's "Deploy alert_rules.yml"
+# task, via a plain role-relative `src:` (Ansible's default files/ lookup),
+# not via a `{{ playbook_dir }}/../../observability/...` path.
+#
+# observability/prometheus/rules/fault_classes.yml is a synced reference
+# copy only, kept for `docker compose -f observability/docker-compose.yml`
+# local/lint parity — it is NOT what the monitoring_stack role reads. The
+# two must be kept in step by hand; nothing currently keeps them
+# automatically synced (same caveat as observability/docker-compose.yml's
+# own header note for the docker-compose.yml/.j2 split).
+#
+# Root cause this split fixes: the previous `{{ playbook_dir }}/../..` path
+# assumed `ansible/` and `observability/` are sibling directories, which is
+# true for a full repo checkout but false for the orchestrator's own scoped
+# host sync (`/opt/orchestrator`, AD-010) -- that directory deliberately
+# never included `observability/`. Running `deploy.yml --tags monitoring`
+# from `/opt/orchestrator` (the directory §15.3's own operational rule
+# points at) therefore failed at this exact task every time; a prior
+# session's successful deploy of this file must have run from
+# `/opt/self-healing-thesis` instead (a separate, less-current host copy
+# that does have `observability/`) -- confirmed live by that directory's
+# older file mtimes relative to `/opt/orchestrator`. Keeping the deploy
+# source inside the role's own `files/` directory removes the dependency on
+# which host directory happens to have `observability/` synced.
+# =============================================================================
+
+# =============================================================================
+# alert_rules.yml — Prometheus alerting rules
+#
+# Six fault-class rules corresponding to Thesis Table 3.3.
+# Each rule emits a closed-vocabulary fault_type label consumed verbatim by
+# the orchestrator's rule-based classifier (routing.yaml → classifier.py).
+#
+# Three invariants enforced on every rule (Thesis §4.3.1):
+#   1. for-window ≥ 30 s — a single noisy scrape cannot trigger remediation.
+#   2. fault_type label drawn from the closed vocabulary of six values.
+#   3. Threshold validated against steady-state telemetry before the campaign.
+#
+# Fault-class → actuator routing (Ansible-first, Terraform last resort):
+#   cpu_overload        → Ansible  kill_runaway_process.yml   (max_retries=2)
+#   memory_exhaustion   → Ansible  memory_cleanup.yml         (max_retries=2)
+#   disk_saturation     → Ansible  disk_cleanup.yml           (max_retries=2)
+#   service_crash       → Ansible  service_crash.yml          (max_retries=2)
+#   configuration_drift → Ansible  config_reapply.yml         (max_retries=1)
+#   instance_failure    → Terraform targeted apply             (max_retries=0)
+#
+# Thresholds sourced from Thesis Table 3.3 and §4.3.1.
+# =============================================================================
+
+groups:
+  - name: self_healing_thesis
+    interval: 15s   # evaluation cadence = Prometheus scrape_interval
+
+    rules:
+
+      # ── Watchdog — always-firing pipeline health signal ──────────────────
+      - alert: Watchdog
+        expr: vector(1)
+        labels:
+          severity: none
+        annotations:
+          summary: "Prometheus → Alertmanager pipeline is alive"
+          description: >
+            Continuously firing alert routed to the null receiver in Alertmanager.
+            Absence of this alert indicates a break in the Monitor pillar.
+
+      # ── Fault Class 1: CPU Overload ──────────────────────────────────────
+      # Thesis Table 3.3: idle CPU < 15% (= used > 85%), for 30s, severity: high.
+      # Injection: stress-ng --cpu 2 --timeout 120s on t3.micro drives both
+      # vCPUs to ~100% each; idle drops to < 5% well below the 15% threshold.
+      # Remediation: Ansible kill_runaway_process.yml
+      - alert: CPUOverload
+        expr: |
+          (
+            100 * (
+              1 - avg by (instance, node_name, ec2_instance_id) (
+                rate(node_cpu_seconds_total{mode="idle", job="node_exporter"}[1m])
+              )
+            )
+          ) > 85
+        for: 30s
+        labels:
+          severity: high
+          fault_type: cpu_overload
+        annotations:
+          summary: "CPU Overload on {{ $labels.node_name }} ({{ $labels.instance }})"
+          description: >
+            CPU utilisation {{ $value | printf "%.1f" }}% (idle < 15%) sustained
+            for 30s on {{ $labels.node_name }}.
+            Remediation: Ansible kill_runaway_process.yml — identify and kill
+            top CPU consumer (unless protected), restart NGINX if implicated.
+
+      # ── Fault Class 2: Memory Exhaustion ────────────────────────────────
+      # Thesis Table 3.3: MemAvailable/MemTotal < 0.10, for 30s, severity: high.
+      # Injection: stress-ng --vm 2 --vm-bytes 80% allocates 160% of RAM across
+      # 2 workers, driving MemAvailable to near zero on t3.micro (1 GiB).
+      # Remediation: Ansible memory_cleanup.yml
+      - alert: MemoryExhaustion
+        expr: |
+          (
+            node_memory_MemAvailable_bytes{job="node_exporter"}
+            / node_memory_MemTotal_bytes{job="node_exporter"}
+          ) < 0.10
+        for: 30s
+        labels:
+          severity: high
+          fault_type: memory_exhaustion
+        annotations:
+          summary: "Memory Exhaustion on {{ $labels.node_name }} ({{ $labels.instance }})"
+          description: >
+            Available memory {{ $value | humanizePercentage }} of total (< 10%)
+            sustained for 30s on {{ $labels.node_name }}.
+            Remediation: Ansible memory_cleanup.yml — drop page cache,
+            kill top memory consumer, restart NGINX.
+
+      # ── Fault Class 3: Disk Saturation ──────────────────────────────────
+      # Thesis Table 3.3: filesystem free < 10%, for 60s, severity: high.
+      # Injection: fallocate -l 1G /var/tmp/fill.bin on 20 GiB root volume
+      # drives free space to ~5%, well below the 10% threshold.
+      # Remediation: Ansible disk_cleanup.yml
+      - alert: DiskSaturation
+        expr: |
+          (
+            node_filesystem_avail_bytes{
+              job="node_exporter",
+              mountpoint="/",
+              fstype!~"tmpfs|devtmpfs|overlay"
+            }
+            / node_filesystem_size_bytes{
+              job="node_exporter",
+              mountpoint="/",
+              fstype!~"tmpfs|devtmpfs|overlay"
+            }
+          ) * 100 < 10
+        for: 60s
+        labels:
+          severity: high
+          fault_type: disk_saturation
+        annotations:
+          summary: "Disk Saturation on {{ $labels.node_name }} ({{ $labels.instance }})"
+          description: >
+            Root filesystem {{ $value | printf "%.1f" }}% free (< 10%) sustained
+            for 60s on {{ $labels.node_name }}.
+            Remediation: Ansible disk_cleanup.yml — scan /var/tmp and rotated
+            NGINX logs; remove until 1 GB reclaimed or usage below 80%.
+
+      # ── Fault Class 4: Service Crash ────────────────────────────────────
+      # Thesis Table 3.3: nginx service down, for 30s, severity: critical.
+      # Detected via node_exporter systemd collector (--collector.systemd enabled
+      # in user_data_target.sh.tpl).  Requires nginx.service to be tracked.
+      # Injection: systemctl stop nginx; service drops to inactive/dead.
+      # Remediation: Ansible service_crash.yml
+      - alert: ServiceCrash
+        expr: |
+          node_systemd_unit_state{
+            job="node_exporter",
+            name="nginx.service",
+            state="active"
+          } == 0
+        for: 30s
+        labels:
+          severity: critical
+          fault_type: service_crash
+          service_name: nginx
+        annotations:
+          summary: "Service Crash: nginx.service on {{ $labels.node_name }}"
+          description: >
+            nginx.service is not in 'active' state for 30s on {{ $labels.node_name }}.
+            Remediation: Ansible service_crash.yml — systemctl restart nginx,
+            wait up to 30s for ActiveState=active.
+
+      # ── Fault Class 5: Configuration Drift ──────────────────────────────
+      # Thesis Table 3.3: canonical_hash != running_hash, for 30s, severity: medium.
+      # canonical_hash / running_hash are custom gauges published every 60s by
+      # the config-drift-check.timer systemd unit (user_data_target.sh.tpl)
+      # through the Node Exporter textfile collector — not natively emitted
+      # by Node Exporter (Thesis §3.4.1).
+      # Injection: sed -i 's/worker_connections [0-9]*/worker_connections 99999/'
+      # Remediation: Ansible config_reapply.yml
+      - alert: ConfigurationDrift
+        expr: canonical_hash{job="node_exporter"} != running_hash{job="node_exporter"}
+        for: 30s
+        labels:
+          severity: medium
+          fault_type: configuration_drift
+        annotations:
+          summary: "Configuration Drift: nginx.conf hash mismatch on {{ $labels.node_name }}"
+          description: >
+            canonical_hash != running_hash sustained for 30s on {{ $labels.node_name }}.
+            Caused by configuration drift (invalid nginx.conf injected by fault harness).
+            Remediation: Ansible config_reapply.yml — push canonical nginx.conf
+            from version-controlled template, reload NGINX, assert diff is empty.
+
+      # ── Fault Class 6: Instance Failure ─────────────────────────────────
+      # Thesis Table 3.3: node_exporter target unreachable, for 60s, severity: critical.
+      # for: 60s (longer than other rules) to avoid false positives from transient
+      # scrape failures; a truly terminated instance will remain unreachable.
+      # Injection: aws ec2 terminate-instances (direct EC2 API — not via SSM,
+      # since the instance becomes unreachable immediately after termination).
+      # Remediation: workspace-scope `terraform apply` on the targets/
+      # workspace (no -target flag — Ch3 §3.6.2) reconciles
+      # the missing instance from module.compute.aws_instance.targets for_each.
+      - alert: InstanceFailure
+        expr: |
+          up{job="node_exporter"} == 0
+        for: 60s
+        labels:
+          severity: critical
+          fault_type: instance_failure
+        annotations:
+          summary: "Instance Failure: {{ $labels.node_name }} unreachable"
+          description: >
+            Node Exporter on {{ $labels.node_name }} ({{ $labels.instance }})
+            has been unreachable for 60s — instance is likely terminated.
+            Remediation: workspace-scope `terraform apply` on the targets/
+            workspace reconciles the missing {{ $labels.node_name }}
+            instance from the for_each map (no -target flag).
+            recreates the terminated instance (last-resort Terraform actuator).

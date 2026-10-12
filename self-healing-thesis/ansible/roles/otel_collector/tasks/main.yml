@@ -1,0 +1,79 @@
+---
+# roles/otel_collector/tasks/main.yml
+# Target-side OpenTelemetry Collector ("OTel Agent") — never implemented
+# before this role, despite bootstrap.yml's header comment claiming it was
+# . Installs the official otelcol-contrib .deb (matching
+# the pattern this codebase already uses for binaries with no APT repo,
+# e.g. Node Exporter/Terraform in bootstrap.yml), configures it to scrape
+# local host metrics and forward them to the central OTel Collector on the
+# monitoring host (observability/otelcol/config.yaml's otlp receiver on
+# :4317), and exposes its own Prometheus self-telemetry on :8889 (mirroring
+# the central collector's own exporter pattern) so export success/failure
+# can be verified from outside (orchestrator/observability_checker.py).
+#
+# Requires the caller to define `monitoring_host_ip`. `otel_collector_version`
+# comes from this role's own defaults.
+#
+# The .deb package name and asset naming follow the official
+# open-telemetry-collector-releases GitHub release convention.
+
+- name: "OTel Collector | Download otelcol-contrib {{ otel_collector_version }} .deb"
+  get_url:
+    url: "https://github.com/open-telemetry/opentelemetry-collector-releases/releases/download/v{{ otel_collector_version }}/otelcol-contrib_{{ otel_collector_version }}_linux_amd64.deb"
+    dest: "/tmp/otelcol-contrib_{{ otel_collector_version }}_linux_amd64.deb"
+    mode: "0644"
+
+- name: "OTel Collector | Install .deb package"
+  apt:
+    deb: "/tmp/otelcol-contrib_{{ otel_collector_version }}_linux_amd64.deb"
+
+- name: "OTel Collector | Write agent configuration"
+  copy:
+    dest: /etc/otelcol-contrib/config.yaml
+    content: |
+      receivers:
+        hostmetrics:
+          collection_interval: 30s
+          scrapers:
+            cpu: {}
+            memory: {}
+            disk: {}
+
+      processors:
+        batch:
+          timeout: 10s
+
+      exporters:
+        otlp:
+          endpoint: "{{ monitoring_host_ip }}:4317"
+          tls:
+            insecure: true
+        # Self-telemetry — lets orchestrator/observability_checker.py verify
+        # export success/failure counters from outside the agent, the same
+        # way observability/otelcol/config.yaml's central collector exposes
+        # its own :8889 prometheus exporter.
+        prometheus:
+          endpoint: "0.0.0.0:8889"
+
+      service:
+        pipelines:
+          metrics:
+            receivers:  [hostmetrics]
+            processors: [batch]
+            exporters:  [otlp, prometheus]
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: "OTel Collector | Enable and start otelcol-contrib"
+  systemd:
+    name: otelcol-contrib
+    enabled: yes
+    state: restarted
+    daemon_reload: yes
+
+- name: "OTel Collector | Verify service is active"
+  command: systemctl is-active otelcol-contrib
+  register: otelcol_active
+  changed_when: false
+  failed_when: otelcol_active.stdout != "active"

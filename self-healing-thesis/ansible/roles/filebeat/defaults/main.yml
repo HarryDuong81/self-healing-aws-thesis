@@ -1,0 +1,8 @@
+---
+# roles/filebeat/defaults/main.yml
+# Pinned version matches / roles/monitoring_stack's
+# elasticsearch_version/logstash_version/kibana_version pin (same 9.x ELK
+# release train). Role defaults do not cross plays/roles in Ansible, so this
+# is kept in sync with monitoring_stack/defaults/main.yml by convention, not
+# by reference.
+filebeat_version: "9.4.1"

@@ -1,0 +1,65 @@
+user www-data;
+worker_processes auto;
+pid /run/nginx.pid;
+include /etc/nginx/modules-enabled/*.conf;
+
+events {
+    worker_connections 768;
+    multi_accept on;
+}
+
+http {
+    # Basic settings
+    sendfile on;
+    tcp_nopush on;
+    types_hash_max_size 2048;
+    server_tokens off;
+
+    include /etc/nginx/mime.types;
+    default_type application/octet-stream;
+
+    # JSON access log format (parsed by Logstash)
+    log_format json_combined escape=json
+        '{"time":"$time_iso8601",'
+        '"remote_addr":"$remote_addr",'
+        '"method":"$request_method",'
+        '"uri":"$request_uri",'
+        '"status":$status,'
+        '"bytes_sent":$bytes_sent,'
+        '"request_time":$request_time,'
+        '"http_user_agent":"$http_user_agent",'
+        '"http_referer":"$http_referer"}';
+
+    access_log /var/log/nginx-json/access.log json_combined;
+    error_log  /var/log/nginx/error.log;
+
+    gzip on;
+    gzip_vary on;
+    gzip_types text/plain application/json;
+
+    server {
+        listen 80 default_server;
+        server_name _;
+
+        # Health endpoint — polled by run_experiment.sh and Prometheus
+        location /health {
+            access_log off;
+            add_header Content-Type application/json;
+            return 200 '{"status":"ok","host":"$hostname"}';
+        }
+
+        # Stub status — scraped by Prometheus nginx_status job
+        location /nginx_status {
+            stub_status;
+            # Allow only from monitoring server subnet
+            allow {{ hostvars[groups['monitoring'][0]]['ansible_host'] }};
+            allow 10.0.0.0/8;
+            deny all;
+        }
+
+        location / {
+            add_header Content-Type text/html;
+            return 200 '<html><body><h1>Self-Healing Target: $hostname</h1></body></html>';
+        }
+    }
+}

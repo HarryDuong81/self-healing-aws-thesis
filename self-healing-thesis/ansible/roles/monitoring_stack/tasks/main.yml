@@ -1,0 +1,373 @@
+---
+# roles/monitoring_stack/tasks/main.yml
+# Deploys the full monitoring stack via Docker Compose.
+#
+# Docker CE itself, the ubuntu:docker group membership, and a working
+# `docker compose` subcommand are already installed by bootstrap.yml's
+# "Docker | ..." tasks (get.docker.com convenience script + a symlinked
+# standalone docker-compose binary at /usr/libexec/docker/cli-plugins/).
+# This role used to reinstall Docker a second time via apt + apt_key, which
+# both failed outright (apt-key removed on this AMI — see bootstrap.yml's
+# Filebeat GPG key note) and, once switched to a modern signed-by keyring,
+# conflicted with bootstrap.yml's own keyring for the same repo URL
+# ("Conflicting values set for option Signed-By ... docker.asc !=
+# docker.gpg"). Removed entirely rather than reconciling two installs of
+# the same thing.
+
+# ── Directory structure ───────────────────────────────────────────────────────
+- name: Create monitoring directory tree
+  file:
+    path: "{{ item }}"
+    state: directory
+    owner: ubuntu
+    group: ubuntu
+    mode: "0755"
+  loop:
+    - "{{ monitoring_base_dir }}"
+    - "{{ monitoring_base_dir }}/prometheus"
+    - "{{ monitoring_base_dir }}/prometheus/rules"
+    - "{{ monitoring_base_dir }}/alertmanager"
+    - "{{ monitoring_base_dir }}/grafana"
+    - "{{ monitoring_base_dir }}/grafana/dashboards"
+    - "{{ monitoring_base_dir }}/grafana/provisioning"
+    - "{{ monitoring_base_dir }}/grafana/provisioning/datasources"
+    - "{{ monitoring_base_dir }}/grafana/provisioning/dashboards"
+    - "{{ monitoring_base_dir }}/elk"
+    - "{{ monitoring_base_dir }}/elk/logstash"
+    - "{{ monitoring_base_dir }}/elk/logstash/pipeline"
+    - "{{ monitoring_base_dir }}/elk/elasticsearch"
+    - "{{ monitoring_base_dir }}/elk/elasticsearch/data"
+    - "{{ monitoring_base_dir }}/kibana"
+    - "{{ monitoring_base_dir }}/jaeger"
+    - "{{ monitoring_base_dir }}/otelcol"
+
+- name: Set Elasticsearch data dir permissions (requires world-writable)
+  file:
+    path: "{{ monitoring_base_dir }}/elk/elasticsearch/data"
+    mode: "0777"
+
+# ── Swap ──────────────────────────────────────────────────────────────────────
+# The nine containers' memory limits leave almost no headroom on a 3.8 GiB host,
+# and the stack once crash-looped under the kernel OOM killer for days. A 2 GiB
+# swap file is defence in depth against that, not a substitute for the limits.
+# It used to be added by hand, so it was lost whenever the host was rebuilt;
+# declaring it here makes it part of the reproducible deployment. A low
+# swappiness keeps idle pages resident, so resource measurements still reflect
+# real memory use rather than swap activity.
+- name: Create 2 GiB swap file
+  command: fallocate -l 2G /swapfile
+  args:
+    creates: /swapfile
+
+- name: Restrict swap file permissions
+  file:
+    path: /swapfile
+    owner: root
+    group: root
+    mode: "0600"
+
+- name: Check whether the swap file is already formatted
+  command: blkid -p -o value -s TYPE /swapfile
+  register: swapfile_type
+  changed_when: false
+  failed_when: false
+
+- name: Format the swap file
+  command: mkswap /swapfile
+  when: swapfile_type.stdout != "swap"
+
+- name: List active swap devices
+  command: swapon --show=NAME --noheadings
+  register: swap_active
+  changed_when: false
+
+- name: Enable the swap file
+  command: swapon /swapfile
+  when: "'/swapfile' not in swap_active.stdout"
+
+- name: Persist the swap file in fstab
+  lineinfile:
+    path: /etc/fstab
+    regexp: '^/swapfile\s'
+    line: "/swapfile none swap sw 0 0"
+
+- name: Set low swappiness
+  copy:
+    dest: /etc/sysctl.d/99-self-healing-swappiness.conf
+    content: "vm.swappiness = 10\n"
+    owner: root
+    group: root
+    mode: "0644"
+  register: swappiness_conf
+
+- name: Apply swappiness now
+  command: sysctl -w vm.swappiness=10
+  when: swappiness_conf is changed
+
+# ── Configuration templates ───────────────────────────────────────────────────
+- name: Deploy docker-compose.yml
+  template:
+    src: docker-compose.yml.j2
+    dest: "{{ monitoring_base_dir }}/docker-compose.yml"
+    owner: ubuntu
+    group: ubuntu
+    mode: "0644"
+  notify: restart monitoring stack
+
+# notify: restart monitoring stack, NOT reload prometheus/alertmanager — the
+# HTTP /-/reload API notifies the running process, but it re-reads the config
+# from the same file descriptor/inode the container's bind mount already has
+# open. Ansible's template module replaces files via atomic rename (new
+# inode); the container's existing bind mount keeps referencing the old,
+# now-orphaned inode. Confirmed live: after redeploying prometheus.yml with
+# the Alertmanager-target fix, `docker exec prometheus cat
+# /etc/prometheus/prometheus.yml` still showed the pre-fix content even
+# though the host file and the reload handler both looked correct — only a
+# full container recreation (recreate: always) picks up the new inode.
+- name: Deploy prometheus.yml
+  template:
+    src: prometheus.yml.j2
+    dest: "{{ monitoring_base_dir }}/prometheus/prometheus.yml"
+    owner: ubuntu
+    group: ubuntu
+    mode: "0644"
+  notify: restart monitoring stack
+
+- name: Deploy alertmanager.yml
+  template:
+    src: alertmanager.yml.j2
+    dest: "{{ monitoring_base_dir }}/alertmanager/alertmanager.yml"
+    owner: ubuntu
+    group: ubuntu
+    mode: "0644"
+  notify: restart monitoring stack
+
+# Deploy alert_rules.yml from the canonical source file, kept inside this
+# role's own files/ directory (deployment-session correction, 2026-09-22,
+# CLAUDE.md §15.8) rather than reached via a `{{ playbook_dir }}/../..`
+# path into observability/ -- that path assumed `ansible/` and
+# `observability/` are sibling directories, true for a full repo checkout
+# but false for the orchestrator's own deliberately scoped host sync
+# (/opt/orchestrator, AD-010), which never includes observability/. A
+# plain role-relative src: here uses Ansible's own files/ lookup, which
+# works regardless of what else is synced to whichever host directory this
+# playbook is run from.
+# Workflow v3 fault class names: cpu_overload, memory_exhaustion, disk_saturation,
+# service_crash, configuration_drift, instance_failure. network_degradation removed.
+- name: Deploy alert_rules.yml
+  copy:
+    src: fault_classes.yml
+    dest: "{{ monitoring_base_dir }}/prometheus/rules/alert_rules.yml"
+    owner: ubuntu
+    group: ubuntu
+    mode: "0644"
+  notify: restart monitoring stack
+
+- name: Deploy kibana.yml (disables heavy plugins to reduce startup footprint)
+  copy:
+    src: kibana.yml
+    dest: "{{ monitoring_base_dir }}/kibana/kibana.yml"
+    owner: ubuntu
+    group: ubuntu
+    mode: "0644"
+  notify: restart monitoring stack
+
+- name: Deploy logstash pipeline config
+  template:
+    src: logstash.conf.j2
+    dest: "{{ monitoring_base_dir }}/elk/logstash/pipeline/logstash.conf"
+    owner: ubuntu
+    group: ubuntu
+    mode: "0644"
+  notify: restart monitoring stack
+
+- name: Deploy Grafana datasource provisioning
+  copy:
+    dest: "{{ monitoring_base_dir }}/grafana/provisioning/datasources/datasources.yml"
+    owner: ubuntu
+    group: ubuntu
+    mode: "0644"
+    content: |
+      apiVersion: 1
+      # Delete-by-name before create: Grafana's own datasource DB may already
+      # hold a Prometheus/Elasticsearch/Jaeger row created before uid: below
+      # existed, under an auto-generated uid. Provisioning then tries to
+      # reconcile the file's uid against a row that doesn't carry it, fails
+      # to find a match, and treats that as fatal at startup -- confirmed
+      # live: "Failed to provision data sources: data source not found",
+      # crash-looping the container. Deleting by name first, unconditionally,
+      # avoids the update-by-uid path entirely; recreation below is then a
+      # plain insert every time, matching-uid or not.
+      deleteDatasources:
+        - name: Prometheus
+          orgId: 1
+        - name: Elasticsearch
+          orgId: 1
+        - name: Jaeger
+          orgId: 1
+      datasources:
+        - name: Prometheus
+          type: prometheus
+          uid: prometheus
+          access: proxy
+          url: http://prometheus:9090
+          isDefault: true
+        - name: Elasticsearch
+          type: elasticsearch
+          access: proxy
+          url: http://elasticsearch:9200
+          database: "self-healing-*"
+          jsonData:
+            timeField: "@timestamp"
+            esVersion: "8.0.0"
+        - name: Jaeger
+          type: jaeger
+          access: proxy
+          url: http://jaeger:16686
+  notify: restart monitoring stack
+
+# Remove any datasource provisioning file this task doesn't manage. Confirmed
+# live: a stale, root-owned prometheus.yml from an earlier, non-Ansible-managed
+# deployment attempt coexisted with the file above in the same directory —
+# Grafana loads every *.yml in this directory, so two files each declaring a
+# Prometheus datasource with isDefault: true produced "Only one datasource
+# per organization can be marked as default", crash-looping the container.
+- name: Remove stale (non-Ansible-managed) Grafana datasource files
+  file:
+    path: "{{ monitoring_base_dir }}/grafana/provisioning/datasources/prometheus.yml"
+    state: absent
+
+# src is otelcol-config.yaml (not config.yaml) to avoid an ambiguous
+# filename inside this role's shared files/ directory -- dest: below still
+# writes it out as otelcol/config.yaml on the host, matching what the
+# container expects. Moved here from a `{{ playbook_dir }}/../..` path for
+# the same reason as the alert_rules.yml/kibana.yml tasks above
+# (deployment-session correction, 2026-09-22, CLAUDE.md §15.8).
+- name: Deploy OpenTelemetry Collector config
+  copy:
+    src: otelcol-config.yaml
+    dest: "{{ monitoring_base_dir }}/otelcol/config.yaml"
+    owner: ubuntu
+    group: ubuntu
+    mode: "0644"
+  notify: restart monitoring stack
+
+# Grafana auto-loads dashboard JSON from any path a provider declares (Grafana
+# provisioning config, not the Ansible role config above it) - this provider
+# points at the same directory the docker-compose.yml.j2 Kibana-style volume
+# mount (./grafana/dashboards:/var/lib/grafana/dashboards:ro) already exposes
+# to the container. Without this file, dashboards/*.json on disk are inert.
+- name: Deploy Grafana dashboard provisioning provider
+  copy:
+    dest: "{{ monitoring_base_dir }}/grafana/provisioning/dashboards/dashboards.yml"
+    owner: ubuntu
+    group: ubuntu
+    mode: "0644"
+    content: |
+      apiVersion: 1
+      providers:
+        - name: Default
+          orgId: 1
+          folder: ""
+          type: file
+          disableDeletion: false
+          updateIntervalSeconds: 30
+          options:
+            path: /var/lib/grafana/dashboards
+  notify: restart monitoring stack
+
+# Moved here from a `{{ playbook_dir }}/../..` path for the same reason as
+# the alert_rules.yml/kibana.yml/otelcol config tasks above (deployment-
+# session correction, 2026-09-22, CLAUDE.md §15.8).
+- name: Deploy self-healing-dashboard.json
+  copy:
+    src: self-healing-dashboard.json
+    dest: "{{ monitoring_base_dir }}/grafana/dashboards/self-healing-dashboard.json"
+    owner: ubuntu
+    group: ubuntu
+    mode: "0644"
+  notify: restart monitoring stack
+
+# ── Start monitoring stack ────────────────────────────────────────────────────
+# `pull: always` has to fetch ~9 images the first time (Elasticsearch,
+# Kibana, and Logstash alone are large) sequentially over the SSM channel.
+# ansible.cfg's global ssm_timeout=660 bounds SSM sessions to the monitoring
+# host; it is no longer tied to the Gunicorn worker timeout, which is 2400 s
+# and governs a different path (aws_ssm is not the remediation transport).
+# Raising it globally for one initial image pull is still the wrong trade. Confirmed live: the SSM
+# session itself was torn down mid-pull at 679s ("TargetNotConnected ...
+# is not connected"), just past that 660s ceiling. Override the timeout for
+# this task only.
+- name: Start monitoring stack with Docker Compose
+  community.docker.docker_compose_v2:
+    project_src: "{{ monitoring_base_dir }}"
+    state: present
+    pull: always
+  vars:
+    ansible_aws_ssm_timeout: 1800
+
+- name: Create monitoring-stack systemd service for auto-start
+  copy:
+    dest: /etc/systemd/system/monitoring-stack.service
+    mode: "0644"
+    content: |
+      [Unit]
+      Description=Self-Healing Monitoring Stack (Docker Compose)
+      After=docker.service network.target
+      Requires=docker.service
+
+      [Service]
+      Type=oneshot
+      RemainAfterExit=yes
+      WorkingDirectory={{ monitoring_base_dir }}
+      ExecStart=/usr/bin/docker compose up -d
+      ExecStop=/usr/bin/docker compose down
+      User=ubuntu
+      Group=ubuntu
+
+      [Install]
+      WantedBy=multi-user.target
+  notify: daemon-reload
+
+- name: Enable monitoring-stack service
+  systemd:
+    name: monitoring-stack
+    enabled: yes
+    daemon_reload: yes
+
+# ── Health checks ─────────────────────────────────────────────────────────────
+- name: Wait for Prometheus to be ready
+  uri:
+    url: "http://localhost:{{ prometheus_port }}/-/ready"
+    status_code: 200
+  retries: 12
+  delay: 10
+  register: result
+  until: result.status == 200
+
+- name: Wait for Alertmanager to be ready
+  uri:
+    url: "http://localhost:{{ alertmanager_port }}/-/ready"
+    status_code: 200
+  retries: 12
+  delay: 10
+  register: result
+  until: result.status == 200
+
+- name: Wait for Grafana to be ready
+  uri:
+    url: "http://localhost:{{ grafana_port }}/api/health"
+    status_code: 200
+  retries: 18
+  delay: 10
+  register: result
+  until: result.status == 200
+
+- name: Wait for Elasticsearch to be ready
+  uri:
+    url: "http://localhost:{{ elasticsearch_port }}/_cluster/health"
+    status_code: 200
+  retries: 18
+  delay: 10
+  register: result
+  until: result.status == 200

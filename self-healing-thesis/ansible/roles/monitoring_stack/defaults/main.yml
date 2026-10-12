@@ -1,0 +1,48 @@
+---
+# roles/monitoring_stack/defaults/main.yml
+# Previously undefined anywhere — deploy.yml's "Deploy monitoring stack"
+# play has no vars: block, and this role had no defaults/ directory at all.
+# Confirmed live: "'monitoring_base_dir' is undefined" on the very first
+# templated task. Pinned versions match ;
+# ports are the containers' own conventional defaults.
+
+monitoring_base_dir: /opt/monitoring
+
+# ── Shared with roles/self_healing/defaults/main.yml ───────────────────────────
+# Role defaults do not carry across separate roles/plays in Ansible — this
+# play ("Deploy monitoring stack") is entirely separate from "Deploy
+# self-healing orchestrator", so these must be duplicated here to match,
+# not just defined once in self_healing's defaults.
+orchestrator_base_dir: /opt/orchestrator
+orchestrator_results:  "{{ orchestrator_base_dir }}/results"
+orchestrator_port:     9094
+jaeger_otlp_grpc_port: 4317
+project:               self-healing-thesis
+# NOT "environment" — collides with Ansible's reserved `environment` keyword;
+# see roles/self_healing/defaults/main.yml's comment for the confirmed-live
+# failure this caused.
+deploy_environment:    experiment
+
+# ── Pinned observability stack versions ─────
+prometheus_version:     "3.11.3"
+alertmanager_version:   "0.32.1"
+grafana_version: "13.0" # 13.0.0 was never published — see the architecture documentation Table 4.4 note
+elasticsearch_version:  "9.4.1"
+logstash_version:       "9.4.1"
+kibana_version:         "9.4.1"
+otel_collector_version: "0.152.0"
+jaeger_version:         "2.18.0"
+# Pinned like every other image: the template previously hardcoded
+# `:latest`, which left the RQ3 measurement instrument unreproducible
+# even though .toolchain already declared 0.49.1.
+cadvisor_version:       "0.49.1"
+
+# ── Ports (host-exposed; container-internal defaults for each service) ────────
+prometheus_port:      9090
+alertmanager_port:    9093
+grafana_port:         3000
+elasticsearch_port:   9200
+logstash_beats_port:  5044
+kibana_port:          5601
+jaeger_ui_port:       16686
+node_exporter_port:   9100

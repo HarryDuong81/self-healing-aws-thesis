@@ -1,0 +1,81 @@
+# =============================================================================
+# SUPERSEDED — not deployed.  roles/filebeat renders the live configuration.
+# The `type: log` inputs below were removed outright in Filebeat 9.4.1; the
+# live role uses `filestream` and a `journald` input instead.
+# =============================================================================
+filebeat.inputs:
+  # NGINX JSON access logs
+  - type: log
+    id: nginx-access
+    enabled: true
+    paths:
+      - /var/log/nginx-json/access.log
+    fields:
+      log_type: nginx_access
+      host: "{{ inventory_hostname }}"
+    fields_under_root: false
+    json.keys_under_root: true
+    json.add_error_key: true
+
+  # NGINX error log
+  - type: log
+    id: nginx-error
+    enabled: true
+    paths:
+      - /var/log/nginx/error.log
+    fields:
+      log_type: nginx_error
+      host: "{{ inventory_hostname }}"
+
+  # System syslog + auth.log
+  - type: log
+    id: syslog
+    enabled: true
+    paths:
+      - /var/log/syslog
+      - /var/log/auth.log
+    fields:
+      log_type: syslog
+      host: "{{ inventory_hostname }}"
+
+  # Journald (self-healing logger -t self-healing messages)
+  - type: journald
+    id: journald
+    enabled: true
+    include_matches:
+      - SYSLOG_IDENTIFIER=self-healing
+      - SYSLOG_IDENTIFIER=nginx
+      - SYSLOG_IDENTIFIER=node_exporter
+      - SYSLOG_IDENTIFIER=amazon-ssm-agent
+    fields:
+      log_type: syslog
+      host: "{{ inventory_hostname }}"
+
+output.logstash:
+  hosts:
+    - "{{ hostvars[groups['monitoring'][0]]['ansible_host'] }}:{{ logstash_beats_port }}"
+  worker: 1
+  bulk_max_size: 512
+  timeout: 30
+  loadbalance: false
+
+processors:
+  - add_cloud_metadata: {}
+  - add_fields:
+      target: ""
+      fields:
+        project: "{{ project }}"
+        environment: "{{ deploy_environment }}"
+
+queue.mem:
+  events: 4096
+  flush.min_events: 512
+  flush.timeout: 5s
+
+logging.level: warning
+logging.to_files: true
+logging.files:
+  path: /var/log/filebeat
+  name: filebeat.log
+  keepfiles: 3
+  permissions: 0640

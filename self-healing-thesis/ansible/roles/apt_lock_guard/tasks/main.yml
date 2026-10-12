@@ -1,0 +1,55 @@
+---
+# roles/apt_lock_guard/tasks/main.yml
+# Extracted from ansible/bootstrap.yml's target_nodes play so both the
+# cold-deploy bootstrap play and ansible/playbooks/diagnostic_agents.yml
+# (invoked by the orchestrator's Execute layer after instance_failure
+# recreation) share one guard instead of two copies — confirmed live: the
+# NEW diagnostic_agents.yml playbook, run against a just-recreated instance
+# without this guard, failed on its very first apt task ("E: Could not get
+# lock /var/lib/dpkg/lock-frontend. It is held by process ... apt-get") —
+# the exact failure mode this guard exists to prevent.
+#
+# Fresh Ubuntu AMI boots run cloud-init's own apt operations plus
+# apt-daily.timer/unattended-upgrades in the background immediately after
+# first boot, holding the dpkg/apt lock. Without waiting for it,
+# "apt-get update/upgrade" blocks silently (no output) until the SSM
+# session's own idle-output timeout kills the connection — reported as
+# "unreachable" with no indication an apt lock was ever involved.
+# Confirmed live (bootstrap.yml history): three freshly terraform-replaced
+# targets all hung on this exact task for 45 minutes before SSM reported
+# them unreachable.
+#
+# The "stop/disable timers" + "wait for lock" pair alone is NOT sufficient
+# this early in an instance's lifecycle — confirmed live via
+# diagnostic_agents.yml running against an instance where SSM had only
+# just come online ~5s before Ansible started: the lock-wait check passed
+# (lock briefly free), but `apt-get install` still hit "Could not get lock
+# /var/lib/dpkg/lock-frontend" ~3-4s later. cloud-init's own one-time
+# boot-time package operations (separate from the periodic
+# apt-daily.timer/unattended-upgrades we stop below) can still be actively
+# running and reacquire the lock between our check and the real apt
+# command. Waiting for cloud-init itself to fully finish first closes that
+# race at the source, rather than just narrowing the window.
+
+- name: "System | Wait for cloud-init to finish (closes the apt-lock race at the source)"
+  command: cloud-init status --wait
+  changed_when: false
+  failed_when: false   # cloud-init exits non-zero on some warnings; the wait itself is what matters here
+
+- name: "System | Stop and disable automatic apt/unattended-upgrade timers"
+  shell: |
+    systemctl stop apt-daily.timer apt-daily-upgrade.timer unattended-upgrades.service apt-daily.service apt-daily-upgrade.service 2>/dev/null || true
+    systemctl disable apt-daily.timer apt-daily-upgrade.timer unattended-upgrades.service 2>/dev/null || true
+  changed_when: false
+
+- name: "System | Wait for any in-progress apt/dpkg lock to clear"
+  shell: |
+    for i in $(seq 1 60); do
+      if ! fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1 && ! fuser /var/lib/dpkg/lock >/dev/null 2>&1 && ! fuser /var/lib/apt/lists/lock >/dev/null 2>&1; then
+        exit 0
+      fi
+      sleep 5
+    done
+    echo "Timed out waiting for apt/dpkg lock after 300s" >&2
+    exit 1
+  changed_when: false

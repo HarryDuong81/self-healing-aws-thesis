@@ -1,0 +1,480 @@
+# =============================================================================
+# NOT DEPLOYED — lint and reference copy only.
+#
+# The stack that runs on the monitoring host is rendered from
+#     ansible/roles/monitoring_stack/templates/docker-compose.yml.j2
+# whose image tags come from that role's defaults/main.yml.  This file is kept
+# because `make compose-lint` and the CI workflow validate it with
+# `docker compose config -q`, which cannot parse the Jinja template directly.
+#
+# Consequence worth knowing: the lint checks THIS file, not the rendered one.
+# Keep the two in step by hand, and treat the template as authoritative for
+# anything that reaches a host.  `make verify-pins` cross-checks the image
+# versions between .toolchain and the role defaults, but not this file.
+# =============================================================================
+---
+# =============================================================================
+# observability/docker-compose.yml
+#
+# Self-Healing Thesis — Complete Observability Stack
+# Thesis Table 4.3 (pinned component versions)
+#
+# Toolchain pins (immutable — changing versions invalidates the campaign):
+#   Prometheus          v3.11.3
+#   Alertmanager        v0.32.1
+#   Grafana             v13.0.0
+#   Elasticsearch       9.4.1
+#   Logstash            9.4.1
+#   Kibana              9.4.1
+#   Jaeger              2.18.0
+#   OTel Collector      0.152.0
+#   cAdvisor            v0.49.1
+#
+# The Flask Orchestrator is NOT a service in this compose file. It runs as a
+# native systemd unit on the monitoring host (gunicorn + Flask, deployed by
+# the self_healing Ansible role), not as a container — see the note on the
+# removed orchestrator service, below, for why.
+#
+# Network design:
+#   - All containers join the `monitoring` bridge network.
+#   - Alertmanager uses network_mode: host so it can reach the
+#     systemd-managed orchestrator via the host's private IP on port 9094,
+#     without additional routing rules.
+#   - cAdvisor mounts the host filesystem (privileged) to measure container
+#     resource consumption for RQ3.  Its own footprint is excluded from the
+# RQ3 aggregate .
+#
+# Run:
+#   docker compose up -d          # start all services
+#   docker compose ps             # verify all are healthy
+#   docker compose down -v        # destroy (preserves named volumes by default)
+# =============================================================================
+
+name: self-healing-observability
+
+networks:
+  monitoring:
+    driver: bridge
+    name: monitoring
+
+volumes:
+  prometheus_data:
+    name: self_healing_prometheus_data
+  grafana_data:
+    name: self_healing_grafana_data
+  elasticsearch_data:
+    name: self_healing_elasticsearch_data
+  jaeger_data:
+    name: self_healing_jaeger_data
+
+services:
+
+  # ── Prometheus ──────────────────────────────────────────────────────────────
+  # Detection pillar: scrapes Node Exporter (target nodes) + orchestrator
+  # /metrics.  Evaluates alert rules in prometheus/rules/fault_classes.yml.
+  # Forwards fired alerts to Alertmanager via remote_write → webhook.
+  prometheus:
+    image: prom/prometheus:v3.11.3
+    container_name: prometheus
+    restart: unless-stopped
+    # Deployment-session rebalance (2026-09-22): RQ3's own 24-sample steady-
+    # state data put this container's p95 at 108.8 MiB against the previous
+    # 512m limit (79% headroom unused) while Logstash/Elasticsearch/Kibana
+    # were pinned at their own limits and OOM-crash-looping host-wide
+    # (CLAUDE.md §15.8). Reclaimed to fund headroom for those three.
+    mem_limit: 160m
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./prometheus/rules:/etc/prometheus/rules:ro
+      - prometheus_data:/prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--storage.tsdb.retention.time=30d"
+      - "--web.enable-lifecycle"
+      - "--web.enable-admin-api"
+      - "--web.console.libraries=/etc/prometheus/console_libraries"
+      - "--web.console.templates=/etc/prometheus/consoles"
+    networks:
+      - monitoring
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:9090/-/ready"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"
+
+  # ── Alertmanager ─────────────────────────────────────────────────────────────
+  # Routes fired alerts to the orchestrator webhook on port 9094. The
+  # orchestrator is a systemd service on the host, not a container in this
+  # compose file (see the removed-orchestrator-service note below) — Alert-
+  # manager reaches it via the host's private IP, which is why network_mode:
+  # host is required here rather than the `monitoring` bridge network.
+  alertmanager:
+    image: prom/alertmanager:v0.32.1
+    container_name: alertmanager
+    restart: unless-stopped
+    # Deployment-session rebalance (2026-09-22): RQ3 steady-state p95 was
+    # 22.9 MiB against the previous 128m limit — reclaimed for the
+    # crash-looping Logstash/Elasticsearch/Kibana containers (§15.8).
+    mem_limit: 48m
+    network_mode: host
+    volumes:
+      - ./alertmanager/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+    command:
+      - "--config.file=/etc/alertmanager/alertmanager.yml"
+      - "--storage.path=/alertmanager"
+      - "--web.listen-address=:9093"
+      - "--cluster.listen-address="   # disable clustering — single-node
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:9093/-/ready"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"
+
+  # ── Grafana ──────────────────────────────────────────────────────────────────
+  grafana:
+    image: grafana/grafana:13.0
+    container_name: grafana
+    restart: unless-stopped
+    # Deployment-session rebalance (2026-09-22): confirmed live via dmesg
+    # that Grafana was being OOM-killed repeatedly at the previous 256m
+    # limit (§15.8), despite RQ3's steady-state p95 (207.7 MiB) leaving
+    # nominal headroom — its transient query/render bursts exceed what
+    # steady-phase sampling captured. Modest bump, not full parity with
+    # the JVM services, since it wasn't the dominant crash source.
+    mem_limit: 288m
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_INSTALL_PLUGINS: ""
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+    networks:
+      - monitoring
+    depends_on:
+      prometheus:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:3000/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"
+
+  # ── Elasticsearch ─────────────────────────────────────────────────────────────
+  # Diagnostic pillar: receives log events forwarded by Logstash from target
+  # Filebeat agents.  Log data is NOT wired into the runtime alert path
+  # (log/trace alerting is explicitly future work).
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:9.4.1
+    container_name: elasticsearch
+    restart: unless-stopped
+    # Deployment-session rebalance (2026-09-22): RQ3 steady-state p95 was
+    # 905.6 MiB against the previous 1g limit — only 11% headroom, and
+    # confirmed live via docker stats/dmesg as one of the two containers
+    # (with Logstash) in a continuous host-wide OOM crash-loop since near
+    # boot (CLAUDE.md §15.8). ES_JAVA_OPTS heap (512m) is unchanged; only
+    # the container ceiling around it is raised, to give the existing heap
+    # + off-heap/native overhead genuine room.
+    mem_limit: 1280m
+    ports:
+      - "9200:9200"
+    environment:
+      discovery.type: single-node
+      xpack.security.enabled: "false"
+      ES_JAVA_OPTS: "-Xms512m -Xmx512m"
+      cluster.name: self-healing-cluster
+      bootstrap.memory_lock: "false"
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+      nofile:
+        soft: 65536
+        hard: 65536
+    volumes:
+      - elasticsearch_data:/usr/share/elasticsearch/data
+    networks:
+      - monitoring
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:9200/_cluster/health?wait_for_status=yellow&timeout=5s"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"
+
+  # ── Logstash ──────────────────────────────────────────────────────────────────
+  # Receives Beats input on port 5044 from target Filebeat agents.
+  # Pipeline filter: parses NGINX access/error logs and journald events.
+  logstash:
+    image: docker.elastic.co/logstash/logstash:9.4.1
+    container_name: logstash
+    restart: unless-stopped
+    # Deployment-session rebalance (2026-09-22): RQ3 steady-state p95 was
+    # 511.6 MiB — essentially AT the previous 512m limit — and this
+    # container was confirmed live (docker inspect RestartCount=21,
+    # dmesg) as the primary victim of a continuous host-wide OOM
+    # crash-loop running since near host boot (CLAUDE.md §15.8), which
+    # inflated every official instance_failure trial's
+    # T_observability_restore. LS_JAVA_OPTS heap (256m) is unchanged; only
+    # the container ceiling is raised to give the JVM/JRuby runtime's
+    # non-heap overhead (metaspace, direct buffers, thread stacks, JIT
+    # code cache) genuine room above the heap.
+    mem_limit: 768m
+    ports:
+      - "5044:5044"    # Beats input from target Filebeat agents
+    volumes:
+      - ./logstash/pipeline:/usr/share/logstash/pipeline:ro
+      - ./logstash/config/logstash.yml:/usr/share/logstash/config/logstash.yml:ro
+    environment:
+      LS_JAVA_OPTS: "-Xms256m -Xmx256m"
+      xpack.monitoring.enabled: "false"
+    networks:
+      - monitoring
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:9600/_node/stats"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"
+
+  # ── Kibana ────────────────────────────────────────────────────────────────────
+  kibana:
+    image: docker.elastic.co/kibana/kibana:9.4.1
+    container_name: kibana
+    restart: unless-stopped
+    # Deployment-session rebalance (2026-09-22): RQ3 steady-state p95 was
+    # 492.2 MiB, nearly at the previous 512m limit, contributing to the
+    # host-wide OOM crash-loop documented in CLAUDE.md §15.8. See the
+    # NODE_OPTIONS comment below for why this limit (not the JS heap cap)
+    # was the binding constraint.
+    # Raised again 2026-09-29: confirmed live via a redeploy's own crash
+    # log that the 500m heap cap was still hit during startup plugin
+    # loading (V8 Mark-Compact oscillating 476-505 MiB right at the
+    # ceiling before FATAL ERROR). 850m keeps the same ~150m headroom
+    # above the new 700m heap cap below.
+    mem_limit: 850m
+    ports:
+      - "5601:5601"
+    environment:
+      ELASTICSEARCH_HOSTS: "http://elasticsearch:9200"
+      xpack.security.enabled: "false"
+      SERVER_PUBLICBASEURL: ""
+      # Node/V8 sizes its default heap off the HOST's perceived total memory,
+      # not this container's 512m cgroup limit - confirmed live: Kibana
+      # crash-looped with "FATAL ERROR: JavaScript heap out of memory" on
+      # every startup attempt on the t3.medium monitoring host, even though
+      # docker stats showed it using only ~290MiB (56%) of its own 512m
+      # limit at the moment it died. Elasticsearch/Logstash don't have this
+      # problem because ES_JAVA_OPTS/LS_JAVA_OPTS already bound their JVM
+      # heaps explicitly below their container limits; Kibana had no
+      # equivalent cap. Deployment-session correction (2026-09-22, same day
+      # as the 608m container-limit raise, CLAUDE.md §15.8): 400 was still
+      # too tight for Kibana's own *startup-time* working set -- confirmed
+      # live via a genuine V8 "FATAL ERROR: JavaScript heap out of memory"
+      # crash (docker inspect OOMKilled=false -- this is V8's own heap
+      # ceiling, not the kernel cgroup OOM killer that hit Logstash/
+      # Elasticsearch/Grafana) even after the container mem_limit was
+      # raised, because --max-old-space-size is a Node-level cap
+      # independent of the cgroup limit around it. RQ3's own steady-state
+      # data (p95 492.2 MiB / max 492.7 MiB total container RSS) shows
+      # Kibana comfortably fits once running -- this was a startup spike,
+      # not a steady-state sizing problem.
+      # Raised 500->700 on 2026-09-29: 500m was still not enough for a
+      # genuine redeploy's startup plugin-loading spike (confirmed live,
+      # see the mem_limit comment above) -- 108m of headroom wasn't the
+      # binding constraint, the cap itself was. 700m leaves ~150m of
+      # headroom under the 850m container limit for non-heap V8/Node
+      # overhead. If this still crash-loops, the next lever is trimming
+      # Kibana's default ~185-plugin startup set via kibana.yml
+      # (candidate fix already named in CLAUDE.md §15.8, not yet tried),
+      # not another heap-cap increase.
+      NODE_OPTIONS: "--max-old-space-size=700"
+    volumes:
+      - ./kibana/kibana.yml:/usr/share/kibana/config/kibana.yml:ro
+    networks:
+      - monitoring
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:5601/api/status"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 90s
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"
+
+  # ── Jaeger ────────────────────────────────────────────────────────────────────
+  # Diagnostic pillar: stores distributed traces for post-trial explainability.
+  # Uses the jaegertracing/jaeger image (v2+ unified binary, not all-in-one).
+  # Receives OTLP traces forwarded by the OTel Collector on port 4317.
+  #
+  # NOTE: Thesis §3.4.3/§4.3.2 describe a Jaeger-native gRPC ingest on port
+  # 14250; that describes Jaeger v1's architecture. Jaeger v2 (pinned below)
+  # is OTLP-native by design — see observability/otelcol/config.yaml's
+  # header note for the full explanation of why OTLP:4317 is the correct
+  # topology for this toolchain, not a deviation from it.
+  jaeger:
+    image: jaegertracing/jaeger:2.18.0
+    container_name: jaeger
+    restart: unless-stopped
+    # Deployment-session rebalance (2026-09-22): RQ3 steady-state max was
+    # 34.1 MiB against the previous 256m limit — reclaimed for the
+    # crash-looping Logstash/Elasticsearch/Kibana containers (§15.8).
+    mem_limit: 48m
+    ports:
+      - "16686:16686"    # Jaeger UI
+      - "14268:14268"    # HTTP collector (legacy Jaeger client support)
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+      SPAN_STORAGE_TYPE: badger
+      BADGER_EPHEMERAL: "false"
+      BADGER_DIRECTORY_VALUE: /badger/data
+      BADGER_DIRECTORY_KEY: /badger/key
+    volumes:
+      - jaeger_data:/badger
+    networks:
+      - monitoring
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:16686/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"
+
+  # ── OpenTelemetry Collector ───────────────────────────────────────────────────
+  # Central OTLP ingest gateway.  Receives traces from target instances on
+  # port 4317 (gRPC) and forwards to Jaeger's OTLP receiver.
+  # Kept as a separate service so it can be upgraded independently of Jaeger.
+  otelcol:
+    image: otel/opentelemetry-collector:0.152.0
+    container_name: otelcol
+    restart: unless-stopped
+    # Deployment-session rebalance (2026-09-22): RQ3 steady-state p95 was
+    # 31.5 MiB against the previous 128m limit — reclaimed for the
+    # crash-looping Logstash/Elasticsearch/Kibana containers (§15.8).
+    mem_limit: 56m
+    command: ["--config=/etc/otelcol/config.yaml"]
+    ports:
+      - "4317:4317"     # OTLP gRPC ingest (from target instances and orchestrator)
+      - "4318:4318"     # OTLP HTTP ingest
+      - "8888:8888"     # OTel Collector self-metrics (scraped by Prometheus)
+    volumes:
+      - ./otelcol/config.yaml:/etc/otelcol/config.yaml:ro
+    networks:
+      - monitoring
+    depends_on:
+      jaeger:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:8888/metrics"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "2"
+
+  # ── cAdvisor ─────────────────────────────────────────────────────────────────
+  # Measures container-level CPU, memory, and I/O for the RQ3 observability
+  # overhead analysis.  Privileged access to host cgroups is required.
+  #
+  # IMPORTANT: cAdvisor's own footprint is EXCLUDED from the RQ3 aggregate
+  # (it is the measurement instrument, not a deliberately
+  # deployed observability service).  Exclude container_name="cadvisor" in
+  # the analysis notebooks.
+  cadvisor:
+    image: gcr.io/cadvisor/cadvisor:v0.49.1
+    container_name: cadvisor
+    restart: unless-stopped
+    # Deployment-session rebalance (2026-09-22): RQ3 steady-state p95 was
+    # 53.3 MiB against the previous 128m limit — reclaimed for the
+    # crash-looping Logstash/Elasticsearch/Kibana containers (§15.8).
+    mem_limit: 80m
+    ports:
+      - "8080:8080"
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:ro
+      - /sys:/sys:ro
+      - /var/lib/docker/:/var/lib/docker:ro
+      - /dev/disk/:/dev/disk:ro
+    privileged: true
+    devices:
+      - /dev/kmsg
+    networks:
+      - monitoring
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:8080/healthz"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "2"
+
+  # NOTE: The Flask Orchestrator (Thesis Table 4.3, Listing 4.9: port 9094)
+  # used to be defined here as a container built from orchestrator/Dockerfile,
+  # duplicating the orchestrator already deployed as a systemd service by
+  # the self_healing Ansible role — both bound to the same host port 9094,
+  # which would conflict the moment both were brought up. Removed in favor
+  # of the systemd deployment. Alertmanager's webhook reaches the systemd
+  # orchestrator via the host's private IP instead of a container hostname
+  # (see the Alertmanager service, above, and ansible/roles/monitoring_stack/
+  # templates/alertmanager.yml.j2's webhook_configs). orchestrator/Dockerfile
+  # still exists in the repo, but is not built or run as part of this
+  # compose file — the systemd deployment is the only orchestrator runtime.

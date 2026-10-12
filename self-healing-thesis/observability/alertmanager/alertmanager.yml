@@ -1,0 +1,73 @@
+# =============================================================================
+# NOT DEPLOYED — reference copy only.
+#
+# The monitoring stack is deployed from Ansible templates, not from this
+# directory. This file is superseded by:
+#     ansible/roles/monitoring_stack/templates/alertmanager.yml.j2
+# Any change made here has no effect on a deployed environment, and the two
+# copies have drifted before. Edit the template; treat this file as
+# documentation of intent at best.
+# =============================================================================
+
+# alertmanager.yml — Alertmanager routing configuration
+# =============================================================================
+# Alertmanager uses network_mode: host in docker-compose.yml so it can reach
+# the orchestrator container on the Docker bridge.  The webhook URL therefore
+# uses the Docker bridge gateway IP (172.17.0.1) rather than the container
+# DNS name "orchestrator" (which only resolves within the bridge network).
+#
+# Port 9094 — Thesis Table 4.3, Listing 4.9.
+# group_by [fault_type, instance] — Thesis §3.5.1.
+# repeat_interval 5m for fault alerts — Workflow v5 Phase 7.
+# =============================================================================
+
+global:
+  resolve_timeout: 5m
+
+route:
+  receiver: "null"
+  group_by: ["fault_type", "instance"]
+  group_wait:       10s
+  group_interval:   1m
+  repeat_interval:  4h
+
+  routes:
+    # Silence the Watchdog keepalive
+    - receiver: "null"
+      matchers:
+        - alertname = "Watchdog"
+
+    # All six fault-class alerts → orchestrator (regardless of severity)
+    # configuration_drift has severity=warning; must be explicitly routed here.
+    - receiver: orchestrator
+      matchers:
+        - fault_type =~ "cpu_overload|memory_exhaustion|disk_saturation|service_crash|configuration_drift|instance_failure"
+      group_wait:      10s
+      group_interval:  30s
+      repeat_interval: 5m
+
+inhibit_rules:
+  - source_matchers:
+      - fault_type = "instance_failure"
+    target_matchers:
+      - fault_type =~ "cpu_overload|memory_exhaustion|disk_saturation|service_crash|configuration_drift"
+    equal: ["instance"]
+
+  - source_matchers:
+      - severity = "critical"
+    target_matchers:
+      - severity = "warning"
+    equal: ["instance"]
+
+receivers:
+  - name: "null"
+
+  - name: orchestrator
+    webhook_configs:
+      # Orchestrator runs as a Docker container on port 9094.
+      # Alertmanager is also in Docker on the same host → same bridge network.
+      # Container name "orchestrator" resolves on the Docker bridge.
+      - url: "http://172.17.0.1:9094/alert"   # Docker bridge gateway — host-network Alertmanager
+        send_resolved: true
+        http_config:
+          timeout: 10s

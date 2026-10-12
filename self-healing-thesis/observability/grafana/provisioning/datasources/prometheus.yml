@@ -1,0 +1,27 @@
+# =============================================================================
+# NOT DEPLOYED — reference copy only.
+#
+# The monitoring stack is deployed from Ansible templates, not from this
+# directory. This file is superseded by:
+#     the monitoring_stack role's datasources task
+# Any change made here has no effect on a deployed environment, and the two
+# copies have drifted before. Edit the template; treat this file as
+# documentation of intent at best.
+# =============================================================================
+
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    type: prometheus
+    uid: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    jsonData:
+      httpMethod: POST
+      prometheusType: Prometheus
+      prometheusVersion: "3.11.3"
+      # Align scrape interval with prometheus.yml global.scrape_interval
+      timeInterval: "15s"
+    editable: false

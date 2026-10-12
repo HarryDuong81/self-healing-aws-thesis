@@ -1,0 +1,162 @@
+---
+# ansible/playbooks/disk_cleanup.yml
+# =============================================================================
+# S3 (fault class 3) — Disk Saturation remediation (workflow v3 §9.1)
+#
+# Scans configured cleanup paths, removes largest non-essential files until
+# 1 GB is reclaimed or disk usage falls below 80%.  Records removed files in
+# the Ansible execution log.
+#
+# Actuator : Ansible
+# Transport: SSH :22 from the Monitoring Stack Server (which is itself the
+#            Ansible control node; execute.py runs ansible-playbook as a
+#            local subprocess).  SSM is retained elsewhere in the system --
+#            fault injection, the Plan-layer PingStatus liveness gate, and
+#            manual Session Manager access -- but is not this playbook's
+#            connection transport.
+# Scope    : One target, enforced by --limit <target>
+# Fault    : disk_saturation
+# =============================================================================
+
+- name: "Disk Saturation — Remove large non-essential files"
+  hosts: "{{ target_host | default('all') }}"
+  become: yes
+  gather_facts: no
+
+  vars:
+    disk_safe_pct: 80           # target: below this percentage used
+    reclaim_target_gb: 1        # minimum GB to free
+    cleanup_paths:
+      - /var/tmp
+      - /tmp
+    log_cleanup_paths:
+      - /var/log/nginx
+      - /var/log
+
+  tasks:
+
+    - name: Record disk usage before cleanup
+      command: df -h /
+      register: df_before
+      changed_when: false
+
+    - name: Log disk before
+      debug:
+        msg: "{{ df_before.stdout }}"
+
+    - name: Get current disk usage percentage
+      shell: df / | awk 'NR==2 {gsub(/%/,""); print $5}'
+      register: disk_pct_before
+      changed_when: false
+
+    - name: Remove fault injection fill files (fallocate artefacts)
+      find:
+        paths: "{{ cleanup_paths }}"
+        patterns:
+          - "fill.bin"
+          - "fault_injection_*"
+          - "*.fill"
+          - "fill_*"
+        recurse: yes
+      register: fill_files
+
+    - name: Delete fill files
+      file:
+        path: "{{ item.path }}"
+        state: absent
+      loop: "{{ fill_files.files }}"
+      loop_control:
+        label: "{{ item.path }}"
+
+    - name: Check disk after fill-file removal
+      shell: df / | awk 'NR==2 {gsub(/%/,""); print $5}'
+      register: disk_pct_t1
+      changed_when: false
+
+    - name: Clean package cache if still above threshold
+      apt:
+        autoclean: yes
+      when: disk_pct_t1.stdout | int > disk_safe_pct
+
+    - name: Remove compressed log archives older than 1 day
+      find:
+        paths: "{{ log_cleanup_paths }}"
+        patterns: "*.gz"
+        age: "1d"
+        recurse: yes
+      register: old_gz_logs
+      when: disk_pct_t1.stdout | int > disk_safe_pct
+
+    - name: Delete old compressed logs
+      file:
+        path: "{{ item.path }}"
+        state: absent
+      loop: "{{ old_gz_logs.files | default([]) }}"
+      loop_control:
+        label: "{{ item.path }}"
+
+    - name: Vacuum journald logs
+      command: journalctl --vacuum-size=200M
+      register: journal_vacuum
+      changed_when: "'Freed' in journal_vacuum.stdout"
+
+    - name: Check disk after log cleanup
+      shell: df / | awk 'NR==2 {gsub(/%/,""); print $5}'
+      register: disk_pct_t2
+      changed_when: false
+
+    - name: Remove rotated log files if still above threshold
+      find:
+        paths: "{{ log_cleanup_paths }}"
+        patterns: "*.log.*"
+        age: "7d"
+        recurse: yes
+      register: old_logs
+      when: disk_pct_t2.stdout | int > disk_safe_pct
+
+    - name: Delete old rotated logs
+      file:
+        path: "{{ item.path }}"
+        state: absent
+      loop: "{{ old_logs.files | default([]) }}"
+      loop_control:
+        label: "{{ item.path }}"
+
+    - name: Final disk check
+      shell: df / | awk 'NR==2 {gsub(/%/,""); print $5}'
+      register: disk_pct_final
+      changed_when: false
+      failed_when: disk_pct_final.stdout | int > 95
+
+    # Machine-parseable marker consumed by orchestrator/execute.py, which
+    # forwards the value into the trial record as final_disk_pct.  The
+    # playbook's own success criterion (>95% fails) is deliberately looser
+    # than the DiskSaturation alert's clearance point (~90%), so the final
+    # utilisation is the evidence that distinguishes "dispatch succeeded" from
+    # "alert cleared".  Keep the token on one line.
+    - name: "[REPORT] Emit final disk utilisation for the trial record"
+      debug:
+        msg: "SELF_HEALING_FINAL_DISK_PCT={{ disk_pct_final.stdout | int }}"
+
+    - name: Log disk after cleanup
+      debug:
+        msg: >
+          Disk before: {{ disk_pct_before.stdout }}%
+          After T1 (fill files): {{ disk_pct_t1.stdout }}%
+          After T2 (logs): {{ disk_pct_t2.stdout }}%
+          Final: {{ disk_pct_final.stdout }}%
+
+    - name: Verify /healthz endpoint
+      uri:
+        url: "http://localhost/healthz"
+        status_code: 200
+      retries: 6
+      delay: 5
+      register: health_check
+      until: health_check.status == 200
+
+    - name: Log remediation complete
+      command: >
+        logger -t self-healing
+        "REMEDIATE disk_saturation COMPLETE host={{ inventory_hostname }}
+         disk_before={{ disk_pct_before.stdout }}% disk_after={{ disk_pct_final.stdout }}%"

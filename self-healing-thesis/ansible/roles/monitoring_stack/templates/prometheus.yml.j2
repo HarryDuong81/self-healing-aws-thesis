@@ -1,0 +1,100 @@
+global:
+  scrape_interval:     15s
+  evaluation_interval: 15s
+  scrape_timeout:      10s
+
+  external_labels:
+    project: "{{ project }}"
+    environment: "{{ deploy_environment }}"
+
+rule_files:
+  - "/etc/prometheus/rules/*.yml"
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets:
+            # NOT localhost — Alertmanager runs network_mode: host while
+            # Prometheus runs on the isolated "monitoring" bridge network,
+            # so "localhost" from Prometheus's own container namespace
+            # never reaches it. Confirmed live: CPUOverload fired correctly
+            # in Prometheus, but Alertmanager's /api/v2/alerts stayed
+            # completely empty — the alert was never forwarded at all.
+            # Same class of bug as the orchestrator webhook fix in
+            # alertmanager.yml.j2 (host's private IP, not localhost).
+            - "{{ hostvars[groups['monitoring_host'][0]]['ec2_private_ip'] }}:{{ alertmanager_port }}"
+      timeout: 10s
+
+scrape_configs:
+  # Prometheus self-monitoring
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:{{ prometheus_port }}"]
+
+  # Node Exporter on all 3 target instances.
+  # Each target gets an ec2_instance_id label so the orchestrator's
+  # _resolve_instance_id() can dispatch SSM RunCommand without an extra
+  # describe_instances API call.
+  - job_name: node_exporter
+    static_configs:
+{% for host in groups['target_nodes'] %}
+      - targets: ["{{ hostvars[host]['ec2_private_ip'] }}:{{ node_exporter_port }}"]
+        labels:
+          ec2_instance_id: "{{ hostvars[host]['ec2_instance_id'] }}"
+          node_name: "{{ host }}"
+{% endfor %}
+    relabel_configs:
+      # Strip ":9100" from __address__ so alerts show clean private IPs
+      - source_labels: [__address__]
+        regex:         "([^:]+):\\d+"
+        target_label:  instance
+        replacement:   "${1}"
+
+  # Flask orchestrator metrics
+  #
+  # NOT localhost — same class of bug fixed above for alerting.alertmanagers
+  # (Prometheus runs on the isolated "monitoring" bridge network; "localhost"
+  # from its own container namespace never reaches the orchestrator, which
+  # runs as a host-level systemd/gunicorn process, not a container at all).
+  # Confirmed live: Prometheus reported this target "down" with
+  # "dial tcp [::1]:9094: connect: connection refused" until switched to the
+  # host's private IP.
+  - job_name: orchestrator
+    static_configs:
+      - targets: ["{{ hostvars[groups['monitoring_host'][0]]['ec2_private_ip'] }}:{{ orchestrator_port }}"]
+    metrics_path: /metrics
+
+  # cAdvisor (container resource metrics) — same "not localhost" fix.
+  - job_name: cadvisor
+    static_configs:
+      - targets: ["{{ hostvars[groups['monitoring_host'][0]]['ec2_private_ip'] }}:8080"]
+
+  # Alertmanager — same "not localhost" fix. Alertmanager runs
+  # network_mode: host, so it is not even reachable via the bridge
+  # network's DNS service names either; the host's private IP is required.
+  - job_name: alertmanager
+    static_configs:
+      - targets: ["{{ hostvars[groups['monitoring_host'][0]]['ec2_private_ip'] }}:{{ alertmanager_port }}"]
+
+  # Logstash scrape job intentionally removed: vanilla Logstash 9.4.1 (the
+  # pinned docker.elastic.co image) has no Prometheus-format /metrics
+  # endpoint — confirmed live: "server returned HTTP status 404 Not Found"
+  # (the DNS/addressing itself was fixed to "logstash:9600" first — it's on
+  # the shared "monitoring" bridge network with Prometheus, and its 9600
+  # port is not published to the host at all — but the endpoint simply
+  # doesn't exist). Logstash's own native stats API lives at /_node/stats
+  # (confirmed live, returns real data) but that's Logstash's proprietary
+  # JSON format, not Prometheus exposition format, so Prometheus can't
+  # parse it as metrics without a separate exporter plugin — out of scope
+  # for the pinned toolchain. Logstash is diagnostic-pillar only
+  # (log pipeline); cAdvisor already covers its container-level CPU/memory
+  # for RQ3.
+
+  # Elasticsearch scrape job intentionally removed: vanilla Elasticsearch
+  # 9.4.1 (the pinned docker.elastic.co image, no plugins) has no
+  # /_prometheus/metrics endpoint — confirmed live: "no handler found for
+  # uri [/_prometheus/metrics] and method [GET]". That would require a
+  # third-party Prometheus-exporter plugin baked into a custom image, which
+  # is out of scope for the pinned toolchain. Elasticsearch is
+  # diagnostic-pillar only (log storage); cAdvisor already covers its
+  # container-level CPU/memory for RQ3.

@@ -1,0 +1,89 @@
+# =============================================================================
+# DEPLOYED VERBATIM — this file is shipped to the monitoring host as-is
+# (copied verbatim) by ansible/roles/monitoring_stack/tasks/main.yml.
+# Edits here take effect on the next role run.
+# =============================================================================
+
+# =============================================================================
+# observability/otelcol/config.yaml — OpenTelemetry Collector configuration
+#
+# Receives OTLP traces from:
+#   - Flask orchestrator (via opentelemetry-sdk)
+#   - Target instances (Filebeat OTel traces, if configured)
+#
+# Forwards to Jaeger via OTLP gRPC (port 4317 on the jaeger container).
+#
+# NOTE on Jaeger ingest: the pinned jaegertracing/jaeger:2.18.0 is Jaeger v2,
+# which is itself built on the OTel Collector framework and is OTLP-native --
+# it has no separate "Jaeger protocol" ingest path. The OTel Collector's
+# dedicated `jaeger` gRPC exporter was deprecated and removed from collector
+# distributions before v0.152.0 shipped, so a 14250-based exporter is not
+# available with this toolchain. OTLP-to-OTLP on port 4317 (below) is the
+# correct, version-appropriate topology for Jaeger v2 + OTel Collector
+# v0.152.0. Thesis Ch.3 3.4.3 and Ch.4 4.3.2 were reconciled to match this
+# (both now state that port 14250/tcp is not used); no divergence remains.
+#
+# Toolchain pin: otel/opentelemetry-collector:0.152.0 (Thesis Table 4.2)
+# =============================================================================
+
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  batch:
+    timeout: 10s
+    send_batch_size: 1024
+  memory_limiter:
+    check_interval: 5s
+    limit_mib: 100
+    spike_limit_mib: 25
+
+exporters:
+  # Jaeger v2 is OTLP-native (see header note) — this is a standard OTLP
+  # gRPC export, not a workaround.
+  otlp/jaeger:
+    endpoint: jaeger:4317
+    tls:
+      insecure: true
+
+  prometheus:
+    # NOT 8888 — the OTel Collector has a built-in internal self-telemetry
+    # metrics server that defaults to 0.0.0.0:8888 regardless of anything
+    # configured under exporters:, and it binds before pipeline exporters
+    # start. Confirmed live: "listen tcp 0.0.0.0:8888: bind: address
+    # already in use", crash-looping the container — both the built-in
+    # server and this exporter were trying to bind the same port in the
+    # same process. 8889 is the conventional port to avoid this collision.
+    endpoint: "0.0.0.0:8889"
+    namespace: otelcol
+
+  # `logging` was removed in favor of `debug` before v0.152.0 (the pinned
+  # version here) shipped — confirmed live: "the logging exporter has been
+  # deprecated, use the debug exporter instead", crash-looping the container.
+  debug:
+    verbosity: basic
+
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+  pprof:
+    endpoint: 0.0.0.0:1777
+  zpages:
+    endpoint: 0.0.0.0:55679
+
+service:
+  extensions: [health_check, pprof, zpages]
+  pipelines:
+    traces:
+      receivers:  [otlp]
+      processors: [memory_limiter, batch]
+      exporters:  [otlp/jaeger, debug]
+    metrics:
+      receivers:  [otlp]
+      processors: [memory_limiter, batch]
+      exporters:  [prometheus, debug]

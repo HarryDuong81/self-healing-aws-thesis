@@ -1,0 +1,102 @@
+---
+# ansible/playbooks/service_crash.yml
+# =============================================================================
+# Fault class 4 — service_crash remediation (workflow v3 §9.1)
+#
+# Restarts the affected systemd unit (default: nginx), waits up to 30 s for
+# ActiveState=active, and asserts the unit is not in a failed sub-state.
+# A crash-loop guard aborts if the service has restarted more than 5 times
+# in the last 5 minutes (signals a deeper problem requiring human review).
+#
+# Actuator : Ansible
+# Transport: SSH :22 from the Monitoring Stack Server (which is itself the
+#            Ansible control node; execute.py runs ansible-playbook as a
+#            local subprocess).  SSM is retained elsewhere in the system --
+#            fault injection, the Plan-layer PingStatus liveness gate, and
+#            manual Session Manager access -- but is not this playbook's
+#            connection transport.
+# Scope    : One target, enforced by --limit <target>
+# Fault    : service_crash
+# =============================================================================
+
+- name: "Service Crash — Restart affected service"
+  hosts: "{{ target_host | default('all') }}"
+  become: yes
+  gather_facts: no
+
+  vars:
+    service_name: "{{ fault_service | default('nginx') }}"
+    crash_loop_threshold: 5
+    verification_wait_s: 5
+
+  tasks:
+
+    - name: Check recent restart count (crash-loop guard)
+      shell: |
+        journalctl -u {{ service_name }} --since "5 min ago" \
+          | grep -c "Started\|start request" 2>/dev/null || echo 0
+      register: restart_count
+      changed_when: false
+      failed_when: false
+
+    - name: Abort if crash-loop detected
+      fail:
+        msg: >
+          Crash-loop detected: {{ service_name }} has restarted
+          {{ restart_count.stdout | trim }} times in the last 5 minutes.
+          Manual investigation required.
+      when: restart_count.stdout | trim | int > crash_loop_threshold
+
+    - name: Log pre-restart service status
+      command: systemctl status {{ service_name }}
+      register: status_before
+      changed_when: false
+      failed_when: false
+
+    - name: Restart {{ service_name }}
+      systemd:
+        name: "{{ service_name }}"
+        state: restarted
+
+    - name: Wait for service to become active
+      # Plain 30s pause (no host/port/path condition) - confirmed live:
+      # `delegate_to: localhost` + `connection: local` ran this task on the
+      # monitoring host itself, inheriting the play's `become: yes`. The
+      # orchestrator systemd service's own NoNewPrivileges sandboxing then
+      # blocked sudo from elevating locally ("sudo: The 'no new privileges'
+      # flag is set..."), failing every dispatch attempt on this exact task
+      # regardless of retries. This task has no reason to run anywhere but
+      # the target, like every other task in this play.
+      wait_for:
+        timeout: 30
+
+    - name: Verify service is active
+      command: systemctl is-active {{ service_name }}
+      register: active_check
+      changed_when: false
+      retries: 6
+      delay: 5
+      until: active_check.rc == 0
+
+    - name: Assert service is not in failed sub-state
+      shell: |
+        SUB=$(systemctl show {{ service_name }} --property=SubState --value)
+        echo "SubState: $SUB"
+        [ "$SUB" != "failed" ] || exit 1
+      register: sub_check
+      changed_when: false
+
+    - name: Verify /healthz endpoint
+      uri:
+        url: "http://localhost/healthz"
+        status_code: 200
+      retries: 6
+      delay: 5
+      register: health_check
+      until: health_check.status == 200
+
+    - name: Log remediation complete
+      command: >
+        logger -t self-healing
+        "REMEDIATE service_crash COMPLETE host={{ inventory_hostname }}
+         service={{ service_name }}"

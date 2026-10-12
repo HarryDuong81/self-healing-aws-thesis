@@ -1,0 +1,30 @@
+# ruff.toml — explicit lint selection for the self-healing artefact.
+#
+# The rule set is pinned deliberately. Ruff's *default* selection has widened
+# across releases (0.16.x adds I001, PLW1510, UP0xx and SIM rules that 0.12.x
+# does not), so leaving it implicit means CI's verdict changes when ruff ships
+# a new version rather than when this repository changes. Pinning the version
+# in .toolchain/requirements.txt and the rule set here makes the lint gate
+# reproducible in the same sense as the rest of Chapter 4 Table 4.2.
+#
+# E4 — import placement/shadowing   E7 — statement-level correctness
+# E9 — syntax/IO errors             F  — pyflakes (undefined names, dead code)
+
+target-version = "py314"
+line-length = 100
+
+[lint]
+select = ["E4", "E7", "E9", "F"]
+
+[lint.per-file-ignores]
+# Analysis and experiment scripts manipulate sys.path before importing project
+# modules and use terse one-liners; they are post-campaign tooling, not part of
+# the orchestrator's runtime contract.
+"analysis/*.py"       = ["E402", "E702", "E741"]
+"experiments/**/*.py" = ["E402"]
+
+# Test modules import fixtures for their side effects and adjust sys.path in
+# conftest before importing the module under test. E702 covers the compact
+# `rec = self._valid(); rec[...] = ...` setup lines in the schema-invariant
+# tests, where the two statements are one logical arrangement step.
+"tests/**/*.py"       = ["E402", "E702", "F401"]

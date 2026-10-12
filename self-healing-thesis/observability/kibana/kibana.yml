@@ -1,0 +1,101 @@
+# =============================================================================
+# NOT DEPLOYED — lint and reference copy only (deployment-session
+# correction, 2026-09-22, CLAUDE.md §15.8).
+#
+# The file actually deployed to the monitoring host is
+#     ansible/roles/monitoring_stack/files/kibana.yml
+# whose own header explains why the deploy source moved here: the previous
+# `{{ playbook_dir }}/../../observability/...` path this role used assumed
+# `ansible/` and `observability/` are sibling directories on the Ansible
+# controller, which is true for a full repo checkout but false for the
+# orchestrator's own scoped host sync (/opt/orchestrator, AD-010) -- so
+# `deploy.yml --tags monitoring` run from there (exactly what §15.3's own
+# operational rule tells an operator to do) always failed at this task.
+# This copy is kept only so a local/dev reader sees kibana's config
+# alongside the plain docker-compose.yml in observability/. Keep the two
+# in step by hand -- nothing currently syncs them automatically (same
+# caveat as observability/docker-compose.yml's own header for the
+# docker-compose.yml/.j2 split).
+# =============================================================================
+
+# =============================================================================
+# observability/kibana/kibana.yml — Memory-footprint-reduced configuration
+#
+# ELASTICSEARCH_HOSTS / xpack.security.enabled / SERVER_PUBLICBASEURL are set
+# via docker-compose environment variables (observability/docker-compose.yml),
+# not here — this file only disables features to fit Kibana's 9.4.1 real
+# startup memory footprint inside its 512m container limit on the pinned
+# t3.medium monitoring host.
+#
+# Confirmed live: even with NODE_OPTIONS=--max-old-space-size=400 (a V8 heap
+# cap, which was itself a real and necessary fix — Kibana's default heap
+# sizing goes off the HOST's perceived total memory, not this container's
+# cgroup limit), Kibana still crash-looped with "JavaScript heap out of
+# memory" during its normal startup sequence. The heap cap was being
+# respected (crashes consistently occurred right at ~384-400MB) but Kibana's
+# actual minimum memory need to finish starting exceeded even that — a
+# genuine footprint problem, not a misconfigured ceiling. Disabling the
+# heavier optional plugins below is the first-pass attempt at reducing that
+# real footprint; may need iteration if still insufficient.
+# =============================================================================
+
+server.host: "0.0.0.0"
+
+# ── Disable memory/CPU-heavy solutions and plugins not used in this lab ─────
+xpack.reporting.enabled: false      # PDF/PNG report generation spins up a
+                                     # headless Chromium instance per report —
+                                     # by far the single heaviest optional
+                                     # feature; never used in this lab.
+xpack.canvas.enabled: false         # Workpad/presentation builder — unused.
+# xpack.maps.enabled removed - confirmed live: Kibana 9.4.1 has locked this
+# setting ("enabled status cannot be changed"); Maps is now always-bundled
+# and no longer independently togglable in this version. Not a memory win
+# we can claim here anymore; left disabled implicitly if Kibana does that
+# on its own, otherwise it's just part of the baseline footprint now.
+# xpack.ml.enabled, xpack.fleet.enabled, xpack.infra.enabled,
+# xpack.uptime.enabled, xpack.observability.enabled all removed - confirmed
+# live: xpack.ml.enabled hit the exact same "enabled status cannot be
+# changed" rejection as xpack.maps.enabled above. All five of these are
+# Kibana "solution"-level toggles (as opposed to xpack.reporting/canvas,
+# which are individual plugins) - given two-for-two confirmed locked, the
+# other three in this same category are removed proactively rather than
+# burning a redeploy cycle on each to confirm individually. They are
+# solution-level UI surfaces bundled into Kibana 9.4.1's distribution and
+# no longer independently disableable; not a memory win this file can claim.
+
+# ── Disable outbound calls to Elastic's own SaaS endpoints ──────────────────
+# Confirmed live: Kibana's bundled self-instrumentation APM agent was
+# actively configured to report to Elastic Cloud's own APM server
+# (kibana-cloud-apm.apm.us-east-1.aws.found.io) on every startup — pure
+# overhead for a private lab with no observability value to this project.
+#
+# contextPropagationOnly must be set to false alongside active: false —
+# confirmed live: leaving it at Kibana's own default (true) while active is
+# false is a contradictory combination the apm-config-loader rejects
+# outright at startup ("APM is disabled, but context propagation is
+# enabled"), crashing Kibana in ~1s, before it even reaches the plugin/heap
+# stage this file's other settings are meant to fix.
+elastic.apm.active: false
+elastic.apm.contextPropagationOnly: false
+telemetry.enabled: false
+telemetry.optIn: false
+newsfeed.enabled: false
+
+# ── Agent Builder (Kibana 9.x default-on plugin, new in this major version) ──
+# Discovered live in startup logs ("[plugins.agentBuilder] AgentBuilder
+# telemetry initialized") on the same run that got past the maps/ml
+# solution-lock errors below — never accounted for before now. Guessed
+# config key based on Kibana's `xpack.<solution>.enabled` naming convention;
+# unconfirmed against docs (no live access). May be rejected the same way
+# xpack.maps.enabled/xpack.ml.enabled were, may not exist as a toggle at
+# all, or may work as-is.
+xpack.agentBuilder.enabled: false
+
+# ── Encrypted Saved Objects (separate from the OOM investigation) ───────────
+# Confirmed live in startup logs: "Saved objects encryption key is not
+# set...API keys are being invalidated" / alerting and actions APIs disabled
+# without this. Not a memory fix - a functionality gap noticed in passing
+# while already in this file. Any random 32+ char string works; this one is
+# lab-only (xpack.security.enabled: false everywhere else in this project),
+# not protecting anything of real sensitivity.
+xpack.encryptedSavedObjects.encryptionKey: "cb9a780bf663ab11751e8d382b7102c5"

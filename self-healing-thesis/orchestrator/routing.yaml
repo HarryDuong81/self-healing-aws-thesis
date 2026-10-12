@@ -1,0 +1,87 @@
+# =============================================================================
+# orchestrator/routing.yaml — Fault-to-actuator routing table
+#
+# This file is the ConcernKnowledge artefact of the MAPE-K Knowledge layer
+# (Thesis §3.5.2, §3.7.1).  It maps each of the six canonical fault classes
+# to an actuator, the playbook or Terraform target, the maximum retry count,
+# and the post-remediation validation window.
+#
+# The policy lives in this YAML file rather than in application code so that:
+#   1. Each routing decision is auditable as a configuration change visible in
+#      version control, not buried in application logic.
+#   2. Future changes to the routing (e.g., changing max_retries, swapping a
+#      playbook) appear as a configuration diff rather than a code diff.
+#   3. The routing table can be tested independently of the orchestrator code
+#      (see tests/unit/test_classifier.py).
+#
+# Loaded at startup by classifier.py via yaml.safe_load().
+# Consumed at runtime by execute.py and plan.py.
+#
+# Source of truth: Thesis Table 4.5 (Routing decision parameters) and
+#                  Thesis Appendix 4.A.4 (routing.yaml listing).
+# =============================================================================
+
+fault_classes:
+
+  cpu_overload:
+    actuator:          ansible
+    playbook:          kill_runaway_process.yml
+    max_retries:       2
+    backoff_seconds:   [1, 4]
+    validation_window: 30       # seconds — Thesis Ch.3 Table 3.4 / Ch.4 Table 4.6
+    observability_restore: false
+
+  memory_exhaustion:
+    actuator:          ansible
+    playbook:          memory_cleanup.yml
+    max_retries:       2
+    backoff_seconds:   [1, 4]
+    validation_window: 30
+    observability_restore: false
+
+  disk_saturation:
+    actuator:          ansible
+    playbook:          disk_cleanup.yml
+    max_retries:       2
+    backoff_seconds:   [1, 4]
+    validation_window: 90
+    observability_restore: false
+
+  service_crash:
+    actuator:          ansible
+    playbook:          service_crash.yml
+    max_retries:       2
+    backoff_seconds:   [1, 4]
+    validation_window: 30
+    observability_restore: false
+
+  configuration_drift:
+    actuator:          ansible
+    playbook:          config_reapply.yml
+    max_retries:       1       # deterministic playbook — second retry rarely helps
+    backoff_seconds:   [1]    # one sleep before one retry; [4] never accessed
+    validation_window: 30
+    observability_restore: false
+
+  instance_failure:
+    actuator:          terraform
+    # Terraform target resolved at runtime from the alert's node_name label:
+    # module.compute.aws_instance.targets["<node_name>"]
+    max_retries:       0       # failed apply may leave state partially locked
+    backoff_seconds:   []
+    validation_window: 180     # longer window — EC2 creation + SSM registration
+    # The diagnostic agents do not survive an instance replacement, so this
+    # class alone runs the Execute-layer restore and contributes a
+    # T_observability_restore phase.  Declared here rather than tested for
+    # by name in app.py, so the whole per-class policy lives in one file.
+    observability_restore: true
+
+# =============================================================================
+# Circuit-breaker policy (Thesis §3.5.3, §4.A.6)
+# Per (target, fault_type) tuple.  Opens on >= alert_threshold alerts within
+# window_minutes.  Remains open for cooldown_minutes (or until manual reset).
+# =============================================================================
+circuit_breaker:
+  alert_threshold:    3      # ≥ 3 alerts on same tuple within window → open  (θ = 3)
+  window_minutes:     30     # Delta_t = 30 min — Thesis Sec. 3.5.3 / Ch.4 Sec. 4.4.3
+  cooldown_minutes:   30     # T_cool = 30 min
