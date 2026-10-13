@@ -59,6 +59,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import math
 import os
 import sys
 from pathlib import Path
@@ -116,13 +117,21 @@ def _load_from_s3(s3_prefix: str) -> list[dict]:
 
 
 def _percentile(values: list[float], p: float) -> float:
-    """Compute the p-th percentile using the nearest-rank method."""
+    """Nearest-rank percentile: the value at rank k = ceil(p/100 * n).
+
+    This is the textbook definition, so the 95th percentile of n = 58 values is
+    the 56th smallest (ceil(55.1) = 56).  An earlier version used
+    int(round(p / 100 * n)) - 1, which Python rounds half to even and which is
+    not the nearest-rank rule: it returned the 55th smallest for n = 58.  The
+    product is rounded to nine decimals before ceil() so that floating-point
+    error cannot push an exact integer rank (e.g. 0.95 * 20) up by one.
+    """
     if not values:
         return float("nan")
     sorted_v = sorted(values)
     n        = len(sorted_v)
-    idx      = max(0, int(round(p / 100 * n)) - 1)
-    return sorted_v[idx]
+    k        = math.ceil(round(p / 100 * n, 9))
+    return sorted_v[min(max(k, 1), n) - 1]
 
 
 def compute_conformance(mttr_values: list[float], slo: int) -> dict:

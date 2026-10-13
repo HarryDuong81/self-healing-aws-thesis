@@ -24,6 +24,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import math
 import os
 import sys
 from pathlib import Path
@@ -144,11 +145,12 @@ def _mean(values: list[float]) -> Optional[float]:
 
 
 def _percentile(values: list[float], p: float) -> Optional[float]:
+    """Nearest-rank percentile, rank k = ceil(p/100 * n) (see h3_upper_bound.py)."""
     if not values:
         return None
     s = sorted(values)
-    idx = max(0, int(round(p / 100 * len(s))) - 1)
-    return round(s[idx], 3)
+    k = math.ceil(round(p / 100 * len(s), 9))
+    return round(s[min(max(k, 1), len(s)) - 1], 3)
 
 
 def _summary(values: list[float]) -> dict:

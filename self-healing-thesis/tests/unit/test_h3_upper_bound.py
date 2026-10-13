@@ -80,6 +80,47 @@ def test_no_successful_records_returns_a_failed_not_a_crashed_result():
     assert result["conformance"] is None
 
 
+# ── Nearest-rank percentile ─────────────────────────────────────────────────
+
+def test_nearest_rank_p95_of_58_values_is_the_56th():
+    """k = ceil(0.95 * 58) = ceil(55.1) = 56.  The earlier round()-based rule
+    returned the 55th value, which is not the nearest-rank percentile."""
+    values = [float(i) for i in range(1, 59)]
+    assert h3._percentile(values, 95) == 56.0
+
+
+def test_nearest_rank_exact_integer_rank_is_not_pushed_up_by_float_error():
+    """0.95 * 20 = 19 exactly: the 19th value, not the 20th."""
+    values = [float(i) for i in range(1, 21)]
+    assert h3._percentile(values, 95) == 19.0
+
+
+def test_nearest_rank_matches_the_integer_definition_for_every_small_n():
+    for n in range(1, 301):
+        values = [float(i) for i in range(1, n + 1)]
+        for p in (50, 95):
+            k = -(-p * n // 100)          # ceil(p * n / 100) in integer arithmetic
+            assert h3._percentile(values, p) == float(max(k, 1)), (n, p)
+
+
+def test_nearest_rank_median_of_an_odd_count_is_the_middle_value():
+    values = [float(i) for i in range(1, 58)]      # n = 57
+    assert h3._percentile(values, 50) == 29.0      # ceil(28.5) = 29
+
+
+def test_nearest_rank_of_a_single_value_and_of_nothing():
+    assert h3._percentile([7.0], 95) == 7.0
+    assert h3._percentile([], 95) != h3._percentile([], 95)   # NaN
+
+
+def test_descriptive_percentile_uses_the_same_rule():
+    sys.path.insert(0, str(_ANALYSIS))
+    desc = importlib.import_module("01_descriptive")
+    values = [float(i) for i in range(1, 59)]
+    assert desc._percentile(values, 95) == 56.0
+    assert desc._percentile([], 95) is None
+
+
 # ── The percentile / SLO check itself ────────────────────────────────────────
 
 def test_h3_passes_when_p95_is_at_or_below_the_slo():
