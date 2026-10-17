@@ -1,9 +1,9 @@
 ---
 # =============================================================================
 # site.yml — Master Playbook (workflow v3)
-# Self-Healing Cloud Infrastructure | Ansible-First Remediation Actuators
+# Self-Healing Cloud Infrastructure | Fault-Class Remediation Actuators
 #
-# Workflow v3 Ansible-first routing (5 of 6 fault classes handled by Ansible):
+# Workflow v3 fault-class routing (5 of 6 fault classes handled by Ansible; no fallback between actuators):
 #   cpu_overload        → playbooks/kill_runaway_process.yml
 #   memory_exhaustion   → playbooks/memory_cleanup.yml
 #   disk_saturation     → playbooks/disk_cleanup.yml

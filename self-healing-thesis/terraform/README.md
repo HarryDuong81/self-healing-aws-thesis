@@ -69,7 +69,7 @@ CloudWatch Agent, the `canonical_hash`/`running_hash` drift-detection timer) —
 **diagnostic-path** agents (Filebeat, OTel Collector agent) are installed afterward by the
 Ansible bootstrap play, keeping `terraform apply` idempotent.
 
-**Ansible-first remediation:**
+**Fault-class remediation routing:**
 Five of six fault classes (`cpu_overload`, `memory_exhaustion`, `disk_saturation`,
 `service_crash`, `configuration_drift`) are remediated by Ansible playbooks dispatched
 over **direct SSH** (port 22, `sg-orchestrator` → `sg-targets`, using the Terraform-generated
@@ -560,7 +560,7 @@ for g in rules['data']['groups']:
 "
 ```
 
-✅ Expected rules — 6 fault classes, Ansible-first routing:
+✅ Expected rules — 6 fault classes, routed by fault class:
 ```
   CPUOverload           -> fault_type=cpu_overload         (Ansible, SSH: kill_runaway_process.yml)
   MemoryExhaustion      -> fault_type=memory_exhaustion    (Ansible, SSH: memory_cleanup.yml)

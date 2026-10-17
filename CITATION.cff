@@ -12,9 +12,6 @@ identifiers:
   - type: doi
     value: "10.5281/zenodo.23319490"
     description: "Zenodo concept DOI (all versions)"
-  - type: doi
-    value: "10.5281/zenodo.23332350"
-    description: "Zenodo DOI of version 1.0.1"
-version: "1.0.1"
-date-released: "2026-10-13"
+version: "1.0.2"
+date-released: "2026-10-17"
 abstract: "Closed-loop (MAPE-K) pipeline that detects six fault classes on AWS EC2 from Prometheus metrics and remediates them with Ansible or Terraform. Software artefact of the MSc thesis 'Automated Self-Healing Cloud Infrastructure: An Empirical Study of Observability-Triggered Terraform and Ansible Remediation on AWS EC2'."

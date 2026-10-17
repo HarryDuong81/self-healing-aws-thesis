@@ -42,13 +42,13 @@
 #   2. fault_type label drawn from the closed vocabulary of six values.
 #   3. Threshold validated against steady-state telemetry before the campaign.
 #
-# Fault-class → actuator routing (Ansible-first, Terraform last resort):
+# Fault-class → actuator routing (fixed by fault class; no fallback between actuators):
 #   cpu_overload        → Ansible  kill_runaway_process.yml   (max_retries=2)
 #   memory_exhaustion   → Ansible  memory_cleanup.yml         (max_retries=2)
 #   disk_saturation     → Ansible  disk_cleanup.yml           (max_retries=2)
 #   service_crash       → Ansible  service_crash.yml          (max_retries=2)
 #   configuration_drift → Ansible  config_reapply.yml         (max_retries=1)
-#   instance_failure    → Terraform targeted apply             (max_retries=0)
+#   instance_failure    → Terraform workspace-scope apply             (max_retries=0)
 #
 # Thresholds sourced from Thesis Table 3.3 and §4.3.1.
 # =============================================================================
