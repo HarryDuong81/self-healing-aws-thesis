@@ -37,7 +37,7 @@
 
   vars:
     # Pinned versions — Thesis Table 4.1 / Table 4.3
-    docker_compose_version: "v2.24.0"
+    docker_compose_version: "v5.5.1"
     terraform_version:      "1.14.9"
     aws_cli_version:        "2"        # major; minor handled by install script
     node_exporter_version:  "1.7.0"
