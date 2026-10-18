@@ -155,8 +155,9 @@ trials invalidates the dataset and requires recompiling the thesis. Run
 | ansible-core | **2.17.x** | `pip install "ansible-core>=2.17,<2.18"` |
 | community.aws collection | **9.x** | `ansible-galaxy collection install "community.aws:>=9.0.0,<10.0.0"` |
 | Python (orchestrator, monitoring host) | Native AMI interpreter (Ubuntu 26.04 LTS ships Python 3.14.4) | The orchestrator venv is built directly against this interpreter — see `ansible/roles/self_healing/tasks/main.yml`. `.toolchain`'s `python=3.11` entry and `orchestrator/Dockerfile`'s `python:3.12-slim` base image are both stale; the Dockerfile is not part of the live deployment path (the orchestrator runs as a systemd service on the monitoring host's native Python, not in a container) |
-| Docker Engine | Installed via the `get.docker.com` convenience script during Ansible bootstrap | No exact version pin is enforced beyond what that script currently serves |
-| Docker Compose | **v2.24.0** | Pinned in `ansible/bootstrap.yml` |
+| Docker Engine | **29.8.1** | Installed via the `get.docker.com` convenience script during Ansible bootstrap; this is the version on the monitoring host during the primary campaign. `.toolchain` checks `29.8`; the script itself enforces no exact pin |
+| Docker Compose plugin | **5.5.1** | As reported by `docker compose version` on the monitoring host during the primary campaign; `.toolchain` checks `5.5`. `ansible/bootstrap.yml` separately downloads a standalone `docker-compose` v2.24.0 binary and links it as the CLI plugin, which differs from the version the host reported |
+| AWS CLI | **2.31.35** | Ubuntu `awscli` package (installed by `ansible/roles/common` and the monitoring host `user_data`); not machine-checked |
 | Prometheus | **3.11.3** | `prom/prometheus:v3.11.3` |
 | Alertmanager | **0.32.1** | `prom/alertmanager:v0.32.1` |
 | Grafana | **13.0** | `grafana/grafana:13.0` — `13.0.0` was never published to Docker Hub; confirmed live against the registry API |
